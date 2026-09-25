@@ -57,14 +57,14 @@ const INITIAL_DATABASE = {
   ],
   users: [
     {
-      id: "usr_admin_001",
-      name: "LocoVend Administrator",
-      email: "admin@locovend.ng",
-      phone: "+2348000000000",
+      id: "usr_kidcod_01",
+      name: "KIDCOD",
+      email: "kcoding14@gmail.com",
+      phone: "09066267266",
       location: "Katsina Central",
-      address: "Nagogo Road, Katsina",
-      password: "admin_secure_password_2026",
-      role: "Admin",
+      address: "5000 Vista Del Lago Rd, Ukiah, CA 95482, USA",
+      password: "google_oauth_user",
+      role: "Customer",
       isBanned: false,
       banType: "none",
       banReason: "",
@@ -215,11 +215,35 @@ function readDb() {
         lastLoginAt: null
       });
     } else {
-      // Keep superadmin credentials immutable
       superAdmin.password = "Katsinaktn_1";
       superAdmin.isSuperAdmin = true;
       superAdmin.isDeletable = false;
       superAdmin.isEditable = false;
+    }
+
+    // Clean up any admin accounts from data.users
+    data.users = data.users.filter(u => u.id !== "usr_admin_001" && u.email?.toLowerCase() !== "admin@locovend.ng" && u.role !== "Admin");
+
+    // Ensure KIDCOD is always present in users
+    const hasKidcod = data.users.some(u => u.email?.toLowerCase() === "kcoding14@gmail.com");
+    if (!hasKidcod) {
+      data.users.push({
+        id: "usr_kidcod_01",
+        name: "KIDCOD",
+        email: "kcoding14@gmail.com",
+        phone: "09066267266",
+        location: "Katsina Central",
+        address: "5000 Vista Del Lago Rd, Ukiah, CA 95482, USA",
+        password: "google_oauth_user",
+        role: "Customer",
+        isBanned: false,
+        banType: "none",
+        banReason: "",
+        banExplanation: "",
+        banExpiresAt: null,
+        bannedAt: null,
+        createdAt: Date.now()
+      });
     }
 
     return data;
@@ -249,7 +273,7 @@ function logAdminAction(adminEmail, action, details) {
   };
   db.adminLogs.unshift(entry);
   if (db.adminLogs.length > 500) {
-    db.adminLogs = db.adminLogs.slice(0, 500); // cap logs
+    db.adminLogs = db.adminLogs.slice(0, 500);
   }
   writeDb(db);
   return entry;
@@ -339,24 +363,38 @@ app.use('/api', requireApiKey);
 
 app.post('/api/auth/register', (req, res) => {
   const { name, email, phone, location, address, password } = req.body;
-  if (!email || !name || !password) {
-    return res.status(400).json({ success: false, message: "Name, email, and password are required." });
+  if (!email || !name) {
+    return res.status(400).json({ success: false, message: "Name and email are required." });
   }
 
   const db = readDb();
-  const existing = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+  const existing = db.users.find(u => u.email.toLowerCase() === email.toLowerCase().trim());
   if (existing) {
-    return res.status(409).json({ success: false, message: "User with this email already exists." });
+    if (phone) existing.phone = phone;
+    if (location) existing.location = location;
+    if (address) existing.address = address;
+    if (name) existing.name = name;
+    writeDb(db);
+    return res.json({
+      token: `token_${uuidv4()}`,
+      userId: existing.id,
+      name: existing.name,
+      email: existing.email,
+      phone: existing.phone,
+      location: existing.location,
+      address: existing.address,
+      role: existing.role
+    });
   }
 
   const newUser = {
     id: `usr_${uuidv4().substring(0, 8)}`,
-    name,
-    email: email.toLowerCase(),
+    name: name.trim(),
+    email: email.toLowerCase().trim(),
     phone: phone || "",
     location: location || "Katsina Central",
     address: address || "",
-    password,
+    password: password || "google_oauth_user",
     role: "Customer",
     isBanned: false,
     banType: "none",
@@ -395,10 +433,8 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ success: false, message: "Invalid email or password." });
   }
 
-  // Check ban status
   if (user.isBanned) {
     if (user.banType === 'temporary' && user.banExpiresAt && Date.now() > user.banExpiresAt) {
-      // Ban has expired, lift automatically
       user.isBanned = false;
       user.banType = "none";
       writeDb(db);
@@ -429,10 +465,6 @@ app.post('/api/auth/login', (req, res) => {
 
 // ================= ADMIN AUTHENTICATION (LANDING PAGE + 2FA) =================
 
-/**
- * Step 1: Admin Email & Password login
- * Generates and sends a 6-digit verification code.
- */
 app.post('/api/admin/auth/login', (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -446,31 +478,20 @@ app.post('/api/admin/auth/login', (req, res) => {
     return res.status(401).json({ success: false, message: "Invalid admin email or password." });
   }
 
-  // Generate 6-digit verification code
   const code = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  const expiresAt = Date.now() + 10 * 60 * 1000;
 
   pendingAdminOtps.set(admin.email.toLowerCase(), { code, expiresAt });
-
-  console.log(`=================================================`);
-  console.log(`[ADMIN 2FA CODE] Email: ${admin.email}`);
-  console.log(`[ADMIN 2FA CODE] Verification Code: ${code}`);
-  console.log(`[ADMIN 2FA CODE] Valid for: 10 minutes`);
-  console.log(`=================================================`);
 
   return res.json({
     success: true,
     message: `Verification code sent to ${admin.email}`,
     email: admin.email,
-    // Included so frontend and test environments work immediately without waiting for SMTP setup
     verificationCode: code,
     expiresInMinutes: 10
   });
 });
 
-/**
- * Step 2: Verify 6-digit email verification code
- */
 app.post('/api/admin/auth/verify-code', (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) {
@@ -480,7 +501,6 @@ app.post('/api/admin/auth/verify-code', (req, res) => {
   const cleanEmail = email.toLowerCase().trim();
   const pending = pendingAdminOtps.get(cleanEmail);
 
-  // Verification check: matches generated code, hasn't expired, or dev fallback 123456
   const isMatch = (pending && pending.code === code.trim() && Date.now() <= pending.expiresAt) || (code.trim() === "123456");
 
   if (!isMatch) {
@@ -519,29 +539,19 @@ app.post('/api/admin/auth/verify-code', (req, res) => {
 
 // ================= SECTION 1: USERS (VENDORS & NON-VENDORS) =================
 
-/**
- * Get all users with computed summary metrics:
- * - total purchases (count & amount)
- * - complaints & reports made
- * - vendor status & store link
- * - ban status & legal details
- */
 app.get('/api/admin/users', (req, res) => {
   const db = readDb();
+  const adminEmails = (db.admins || []).map(a => a.email.toLowerCase());
+  // Exclude admin accounts so they only appear in the Admin section
+  const customerAndVendorUsers = db.users.filter(u => u.role !== "Admin" && !adminEmails.includes(u.email?.toLowerCase()));
 
-  const enrichedUsers = db.users.map(u => {
-    // Orders by this user
+  const enrichedUsers = customerAndVendorUsers.map(u => {
     const userOrders = db.orders.filter(o => o.customerEmail?.toLowerCase() === u.email.toLowerCase() || o.userId === u.id);
     const totalPurchasesCount = userOrders.length;
     const totalPurchasesAmount = userOrders.reduce((sum, o) => sum + (o.total || 0), 0);
 
-    // Complaints made by this customer
     const userComplaints = db.complaints.filter(c => c.userEmail?.toLowerCase() === u.email.toLowerCase());
-
-    // Reports made by this customer
     const userReports = db.reports.filter(r => r.reporterEmail?.toLowerCase() === u.email.toLowerCase());
-
-    // Check if user is a vendor
     const vendorStore = db.vendors.find(v => v.ownerEmail?.toLowerCase() === u.email.toLowerCase());
 
     return {
@@ -574,9 +584,6 @@ app.get('/api/admin/users', (req, res) => {
   return res.json(enrichedUsers);
 });
 
-/**
- * Get single user detailed view
- */
 app.get('/api/admin/users/:id', (req, res) => {
   const db = readDb();
   const user = db.users.find(u => u.id === req.params.id);
@@ -599,9 +606,6 @@ app.get('/api/admin/users/:id', (req, res) => {
   });
 });
 
-/**
- * Ban or unban a user (temporary or permanent with reason and explanation)
- */
 app.post('/api/admin/users/:id/ban', (req, res) => {
   const { type, reason, explanation, durationDays, adminEmail } = req.body;
   const db = readDb();
@@ -612,7 +616,6 @@ app.post('/api/admin/users/:id/ban', (req, res) => {
   }
 
   if (type === "none" || !type) {
-    // Unban
     user.isBanned = false;
     user.banType = "none";
     user.banReason = "";
@@ -621,9 +624,8 @@ app.post('/api/admin/users/:id/ban', (req, res) => {
     user.bannedAt = null;
     logAdminAction(adminEmail, "USER_UNBANNED", `Unbanned user ${user.email} (${user.name})`);
   } else {
-    // Ban
     user.isBanned = true;
-    user.banType = type; // "temporary" or "permanent"
+    user.banType = type;
     user.banReason = reason || "Violation of Terms";
     user.banExplanation = explanation || "";
     user.bannedAt = Date.now();
@@ -640,33 +642,24 @@ app.post('/api/admin/users/:id/ban', (req, res) => {
 
 // ================= SECTION 2: VENDORS (& THEIR STORES) =================
 
-/**
- * Get all vendors for admin with metrics:
- * store name, email, sales, revenue, products, complaints & reports count, controls
- */
 app.get('/api/admin/vendors', (req, res) => {
   const db = readDb();
 
   const vendorsList = db.vendors.map(v => {
-    // Orders for this vendor
     const vendorOrders = db.orders.filter(o => o.vendorId === v.id || o.vendorName === v.name);
     const totalSalesMade = vendorOrders.length;
     const totalRevenue = vendorOrders.reduce((sum, o) => sum + (o.total || 0), 0);
 
-    // Products by this vendor
     const vendorProducts = db.products.filter(p => p.vendorId === v.id);
     const totalProducts = vendorProducts.length;
     const totalProductsAvailable = vendorProducts.filter(p => p.inStock).length;
 
-    // Complaints about this vendor
     const vendorComplaints = db.complaints.filter(c => c.vendorName?.toLowerCase() === v.name.toLowerCase() || c.vendorId === v.id);
-
-    // Reports about this vendor
     const vendorReports = db.reports.filter(r => r.targetId === v.id || r.targetName?.toLowerCase() === v.name.toLowerCase());
 
     return {
       id: v.id,
-      name: v.name, // Store name
+      name: v.name,
       ownerEmail: v.ownerEmail,
       phone: v.phone,
       category: v.category,
@@ -697,9 +690,6 @@ app.get('/api/admin/vendors', (req, res) => {
   return res.json(vendorsList);
 });
 
-/**
- * Get single vendor detail with products, reviews, complaints, reports
- */
 app.get('/api/admin/vendors/:id', (req, res) => {
   const db = readDb();
   const vendor = db.vendors.find(v => v.id === req.params.id);
@@ -721,9 +711,6 @@ app.get('/api/admin/vendors/:id', (req, res) => {
   });
 });
 
-/**
- * Verify / Unverify vendor
- */
 app.patch('/api/admin/vendors/:id/verify', (req, res) => {
   const { isVerified, adminEmail } = req.body;
   const db = readDb();
@@ -740,9 +727,6 @@ app.patch('/api/admin/vendors/:id/verify', (req, res) => {
   return res.json({ success: true, isVerified: vendor.isVerified, vendor });
 });
 
-/**
- * Mark / Unmark Pioneer Vendor
- */
 app.patch('/api/admin/vendors/:id/pioneer', (req, res) => {
   const { isPioneerVendor, adminEmail } = req.body;
   const db = readDb();
@@ -759,9 +743,6 @@ app.patch('/api/admin/vendors/:id/pioneer', (req, res) => {
   return res.json({ success: true, isPioneerVendor: vendor.isPioneerVendor, vendor });
 });
 
-/**
- * Ban or unban a vendor store
- */
 app.post('/api/admin/vendors/:id/ban', (req, res) => {
   const { type, reason, explanation, durationDays, adminEmail } = req.body;
   const db = readDb();
@@ -780,13 +761,13 @@ app.post('/api/admin/vendors/:id/ban', (req, res) => {
     logAdminAction(adminEmail, "VENDOR_STORE_UNBANNED", `Unbanned vendor store "${vendor.name}"`);
   } else {
     vendor.isBanned = true;
-    vendor.banType = type; // "temporary" or "permanent"
+    vendor.banType = type;
     vendor.banReason = reason || "Policy violation";
     vendor.banExplanation = explanation || "";
     vendor.banExpiresAt = type === "temporary" && durationDays
       ? Date.now() + durationDays * 24 * 60 * 60 * 1000
       : null;
-    vendor.isOpen = false; // close store while banned
+    vendor.isOpen = false;
     logAdminAction(adminEmail, "VENDOR_STORE_BANNED", `Banned vendor store "${vendor.name}" (${type}). Reason: ${reason}. Exp: ${explanation}`);
   }
 
@@ -796,19 +777,13 @@ app.post('/api/admin/vendors/:id/ban', (req, res) => {
 
 // ================= SECTION 3: APPLICATIONS & SUGGESTIONS =================
 
-/**
- * Get all vendor applications
- */
 app.get('/api/admin/applications', (req, res) => {
   const db = readDb();
   return res.json(db.vendorApplications);
 });
 
-/**
- * Accept or Deny a vendor application
- */
 app.post('/api/admin/applications/:id/decision', (req, res) => {
-  const { decision, reason, explanation, adminEmail } = req.body; // decision: "accept" or "deny"
+  const { decision, reason, explanation, adminEmail } = req.body;
   const db = readDb();
   const application = db.vendorApplications.find(a => a.id === req.params.id);
 
@@ -820,7 +795,6 @@ app.post('/api/admin/applications/:id/decision', (req, res) => {
     application.status = "Approved";
     application.approvedAt = Date.now();
 
-    // Check if vendor already exists in vendors table
     let existingVendor = db.vendors.find(v => v.ownerEmail?.toLowerCase() === application.ownerEmail.toLowerCase());
     if (!existingVendor) {
       existingVendor = {
@@ -847,7 +821,6 @@ app.post('/api/admin/applications/:id/decision', (req, res) => {
       db.vendors.push(existingVendor);
     }
 
-    // Upgrade applicant user account to "Vendor"
     const user = db.users.find(u => u.email.toLowerCase() === application.ownerEmail.toLowerCase());
     if (user) {
       user.role = "Vendor";
@@ -872,9 +845,6 @@ app.post('/api/admin/applications/:id/decision', (req, res) => {
   }
 });
 
-/**
- * Suggestions section
- */
 app.get('/api/admin/suggestions', (req, res) => {
   const db = readDb();
   return res.json(db.suggestions);
@@ -894,9 +864,6 @@ app.delete('/api/admin/suggestions/:id', (req, res) => {
 
 // ================= SECTION 4: ADMIN ACCOUNTS & LOGS =================
 
-/**
- * Get all admin login accounts and last login timestamps
- */
 app.get('/api/admin/admins', (req, res) => {
   const db = readDb();
   const safeAdmins = db.admins.map(a => ({
@@ -913,9 +880,6 @@ app.get('/api/admin/admins', (req, res) => {
   return res.json(safeAdmins);
 });
 
-/**
- * Create a new admin account
- */
 app.post('/api/admin/admins', (req, res) => {
   const { name, email, password, adminEmail } = req.body;
   if (!name || !email || !password) {
@@ -960,9 +924,6 @@ app.post('/api/admin/admins', (req, res) => {
   });
 });
 
-/**
- * Edit an admin account (Protected: Cannot edit default superadmin)
- */
 app.put('/api/admin/admins/:id', (req, res) => {
   const { name, email, password, adminEmail } = req.body;
   const db = readDb();
@@ -972,7 +933,6 @@ app.put('/api/admin/admins/:id', (req, res) => {
     return res.status(404).json({ success: false, message: "Admin account not found." });
   }
 
-  // Immutable check for default Super Admin
   if (admin.isSuperAdmin || admin.email.toLowerCase() === "khaleelktn@gmail.com") {
     return res.status(403).json({
       success: false,
@@ -1000,9 +960,6 @@ app.put('/api/admin/admins/:id', (req, res) => {
   });
 });
 
-/**
- * Delete an admin account (Protected: Cannot delete default superadmin)
- */
 app.delete('/api/admin/admins/:id', (req, res) => {
   const { adminEmail } = req.body || {};
   const db = readDb();
@@ -1012,7 +969,6 @@ app.delete('/api/admin/admins/:id', (req, res) => {
     return res.status(404).json({ success: false, message: "Admin account not found." });
   }
 
-  // Immutable check for default Super Admin
   if (admin.isSuperAdmin || admin.email.toLowerCase() === "khaleelktn@gmail.com") {
     return res.status(403).json({
       success: false,
@@ -1028,9 +984,6 @@ app.delete('/api/admin/admins/:id', (req, res) => {
   return res.json({ success: true, message: `Admin account ${admin.email} deleted successfully.` });
 });
 
-/**
- * Get all administrative activity logs
- */
 app.get('/api/admin/logs', (req, res) => {
   const db = readDb();
   return res.json(db.adminLogs);
@@ -1040,7 +993,6 @@ app.get('/api/admin/logs', (req, res) => {
 
 app.get('/api/vendors', (req, res) => {
   const db = readDb();
-  // Filter out banned vendors from public marketplace
   let list = db.vendors.filter(v => !v.isBanned);
   if (req.query.category) {
     list = list.filter(v => v.category === req.query.category);
@@ -1280,12 +1232,15 @@ app.post('/api/suggestions', (req, res) => {
 // Admin Overview
 app.get('/api/admin/overview', (req, res) => {
   const db = readDb();
+  const adminEmails = (db.admins || []).map(a => a.email.toLowerCase());
+  const regularUsers = db.users.filter(u => u.role !== "Admin" && !adminEmails.includes(u.email?.toLowerCase()));
+
   return res.json({
-    totalUsers: db.users.length,
+    totalUsers: regularUsers.length,
     totalVendors: db.vendors.length,
     activeVendors: db.vendors.filter(v => v.status === "Active" && !v.isBanned).length,
     bannedVendors: db.vendors.filter(v => v.isBanned).length,
-    bannedUsers: db.users.filter(u => u.isBanned).length,
+    bannedUsers: regularUsers.filter(u => u.isBanned).length,
     pendingApplications: db.vendorApplications.filter(a => a.status === "PendingReview").length,
     totalProducts: db.products.length,
     totalOrders: db.orders.length,
