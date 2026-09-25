@@ -74,102 +74,8 @@ const INITIAL_DATABASE = {
       createdAt: Date.now()
     }
   ],
-  vendors: [
-    {
-      id: "vnd_katsina_masa_01",
-      name: "Al-Baraka Masa & Fara Specials",
-      motto: "Authentic Katsina Taste, Hot & Fresh",
-      category: "food_snacks",
-      area: "Rafin Dadi",
-      address: "Near Old Central Market, Rafin Dadi, Katsina",
-      phone: "+2348031234567",
-      ownerEmail: "albaraka@locovend.ng",
-      status: "Active",
-      rating: 4.8,
-      reviewsCount: 34,
-      deliveryTimeMinutes: "15-25 min",
-      deliveryFee: 500,
-      isOpen: true,
-      isVerified: true,
-      isPioneerVendor: true,
-      isBanned: false,
-      banType: "none",
-      banReason: "",
-      banExplanation: "",
-      banExpiresAt: null,
-      logoUri: "https://images.unsplash.com/photo-1555939594-58d7cb561ad1?w=400&q=80",
-      createdAt: Date.now()
-    },
-    {
-      id: "vnd_royal_turare_02",
-      name: "Baitul Oud & Royal Fragrances",
-      motto: "Pure Arabian Oils & Turaren Wuta",
-      category: "perfumes_fragrances",
-      area: "GRA Katsina",
-      address: "Commercial Layout, GRA, Katsina",
-      phone: "+2348069876543",
-      ownerEmail: "baituloud@locovend.ng",
-      status: "Active",
-      rating: 4.9,
-      reviewsCount: 22,
-      deliveryTimeMinutes: "20-30 min",
-      deliveryFee: 600,
-      isOpen: true,
-      isVerified: true,
-      isPioneerVendor: true,
-      isBanned: false,
-      banType: "none",
-      banReason: "",
-      banExplanation: "",
-      banExpiresAt: null,
-      logoUri: "https://images.unsplash.com/photo-1616949755610-8c9bbc08f138?w=400&q=80",
-      createdAt: Date.now()
-    }
-  ],
-  products: [
-    {
-      id: "prd_masa_special_01",
-      name: "Special Katsina Masa Platter (10 pcs) with Yaji",
-      price: 2500,
-      categoryId: "food_snacks",
-      categoryName: "Food & Snacks",
-      vendorId: "vnd_katsina_masa_01",
-      vendorName: "Al-Baraka Masa & Fara Specials",
-      vendorArea: "Rafin Dadi",
-      rating: 4.9,
-      ratingCount: 28,
-      description: "Crispy outer crust, tender fluffy centre served with spicy ground peanut yaji and slow-cooked vegetable soup.",
-      inStock: true,
-      stockCount: 50,
-      images: [
-        "https://images.unsplash.com/photo-1555939594-58d7cb561ad1?w=600&auto=format&fit=crop&q=80",
-        "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=600&auto=format&fit=crop&q=80",
-        "https://images.unsplash.com/photo-1565557623262-b51c2513a641?w=600&auto=format&fit=crop&q=80"
-      ],
-      createdAt: Date.now()
-    },
-    {
-      id: "prd_oud_oil_02",
-      name: "Royal Kalemat Bukhoor & Concentrated Oud Oil (12ml)",
-      price: 6500,
-      categoryId: "perfumes_fragrances",
-      categoryName: "Perfumes & Fragrances",
-      vendorId: "vnd_royal_turare_02",
-      vendorName: "Baitul Oud & Royal Fragrances",
-      vendorArea: "GRA Katsina",
-      rating: 5.0,
-      ratingCount: 19,
-      description: "Original Arabian oil with amber, smoky sandalwood and sweet honey notes. Long lasting 48-hour scent.",
-      inStock: true,
-      stockCount: 20,
-      images: [
-        "https://images.unsplash.com/photo-1616949755610-8c9bbc08f138?w=600&auto=format&fit=crop&q=80",
-        "https://images.unsplash.com/photo-1594035910387-fea47794261f?w=600&auto=format&fit=crop&q=80",
-        "https://images.unsplash.com/photo-1544025162-d76694265947?w=600&auto=format&fit=crop&q=80"
-      ],
-      createdAt: Date.now()
-    }
-  ],
+  vendors: [],
+  products: [],
   vendorApplications: [],
   orders: [],
   complaints: [],
@@ -223,6 +129,10 @@ function readDb() {
 
     // Clean up any admin accounts from data.users
     data.users = data.users.filter(u => u.id !== "usr_admin_001" && u.email?.toLowerCase() !== "admin@locovend.ng" && u.role !== "Admin");
+
+    // Clean up demo vendors & demo products
+    data.vendors = (data.vendors || []).filter(v => v.id !== "vnd_katsina_masa_01" && v.id !== "vnd_royal_turare_02");
+    data.products = (data.products || []).filter(p => p.vendorId !== "vnd_katsina_masa_01" && p.vendorId !== "vnd_royal_turare_02");
 
     // Ensure KIDCOD is always present in users
     const hasKidcod = data.users.some(u => u.email?.toLowerCase() === "kcoding14@gmail.com");
@@ -336,7 +246,8 @@ app.get('/api/docs', (req, res) => {
           getVendorDetail: "GET /api/admin/vendors/:id",
           verifyVendor: "PATCH /api/admin/vendors/:id/verify",
           markPioneer: "PATCH /api/admin/vendors/:id/pioneer",
-          banVendorStore: "POST /api/admin/vendors/:id/ban"
+          banVendorStore: "POST /api/admin/vendors/:id/ban",
+          deleteVendor: "DELETE /api/admin/vendors/:id"
         },
         section3_applications_and_suggestions: {
           listApplications: "GET /api/admin/applications",
@@ -542,7 +453,6 @@ app.post('/api/admin/auth/verify-code', (req, res) => {
 app.get('/api/admin/users', (req, res) => {
   const db = readDb();
   const adminEmails = (db.admins || []).map(a => a.email.toLowerCase());
-  // Exclude admin accounts so they only appear in the Admin section
   const customerAndVendorUsers = db.users.filter(u => u.role !== "Admin" && !adminEmails.includes(u.email?.toLowerCase()));
 
   const enrichedUsers = customerAndVendorUsers.map(u => {
@@ -773,6 +683,21 @@ app.post('/api/admin/vendors/:id/ban', (req, res) => {
 
   writeDb(db);
   return res.json({ success: true, message: "Vendor ban status updated.", vendor });
+});
+
+app.delete('/api/admin/vendors/:id', (req, res) => {
+  const { adminEmail } = req.body || {};
+  const db = readDb();
+  const index = db.vendors.findIndex(v => v.id === req.params.id);
+  if (index === -1) {
+    return res.status(404).json({ success: false, message: "Vendor not found." });
+  }
+
+  const removed = db.vendors.splice(index, 1)[0];
+  db.products = db.products.filter(p => p.vendorId !== req.params.id);
+  logAdminAction(adminEmail, "VENDOR_DELETED", `Deleted vendor "${removed.name}" (${removed.ownerEmail})`);
+  writeDb(db);
+  return res.json({ success: true, message: `Vendor "${removed.name}" deleted successfully.`, vendor: removed });
 });
 
 // ================= SECTION 3: APPLICATIONS & SUGGESTIONS =================
