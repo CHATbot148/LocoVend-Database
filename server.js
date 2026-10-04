@@ -1176,6 +1176,176 @@ app.get('/api/admin/overview', (req, res) => {
   });
 });
 
+// ================= SECTION: STORE IDS (MERCHANT ACTIVATION CODES) =================
+
+function generate6CharStoreId() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let res = "";
+  for (let i = 0; i < 6; i++) {
+    res += chars.charAt(crypto.randomInt(chars.length));
+  }
+  return res;
+}
+
+/**
+ * Get all Store IDs (Admin)
+ */
+app.get(['/api/admin/store-ids', '/api/admin/store-id', '/api/store-ids'], (req, res) => {
+  const db = readDb();
+  if (!db.storeIds) db.storeIds = [];
+  return res.json(db.storeIds);
+});
+
+/**
+ * Create a new Store ID (Admin)
+ */
+app.post(['/api/admin/store-ids', '/api/admin/store-id', '/api/store-ids', '/api/admin/generate-store-id'], (req, res) => {
+  const { accountEmail, email, code, adminEmail } = req.body || {};
+  const targetEmail = (accountEmail || email || "").toLowerCase().trim();
+
+  if (!targetEmail || !targetEmail.includes("@")) {
+    return res.status(400).json({ success: false, message: "Valid vendor account email is required." });
+  }
+
+  const db = readDb();
+  if (!db.storeIds) db.storeIds = [];
+
+  let finalCode = (code || generate6CharStoreId()).toUpperCase().trim();
+  if (finalCode.length !== 6) {
+    return res.status(400).json({ success: false, message: "Store ID must be exactly 6 characters." });
+  }
+
+  if (db.storeIds.some(s => s.code.toUpperCase() === finalCode)) {
+    return res.status(409).json({ success: false, message: `A Store ID with code ${finalCode} already exists.` });
+  }
+
+  const newStoreId = {
+    id: `sid_${uuidv4().substring(0, 8)}`,
+    code: finalCode,
+    accountEmail: targetEmail,
+    email: targetEmail,
+    status: "active",
+    isRedeemed: false,
+    redeemedAt: null,
+    redeemedByVendorId: null,
+    createdAt: Date.now(),
+    createdByAdmin: adminEmail || "SuperAdmin"
+  };
+
+  db.storeIds.unshift(newStoreId);
+  writeDb(db);
+
+  logAdminAction(adminEmail || "SuperAdmin", "STORE_ID_CREATED", `Generated 6-character Store ID ${finalCode} for ${targetEmail}`);
+
+  return res.status(201).json({
+    success: true,
+    storeId: {
+      id: newStoreId.id,
+      code: newStoreId.code,
+      email: newStoreId.email,
+      accountEmail: newStoreId.accountEmail,
+      createdAt: newStoreId.createdAt,
+      redeemedAt: null,
+      isRedeemed: false,
+      status: "active"
+    },
+    ...newStoreId
+  });
+});
+
+/**
+ * Delete / Revoke a Store ID (Admin)
+ */
+app.delete(['/api/admin/store-ids/:id', '/api/admin/store-ids/:code'], (req, res) => {
+  const param = req.params.id || req.params.code;
+  const db = readDb();
+  if (!db.storeIds) db.storeIds = [];
+
+  const index = db.storeIds.findIndex(s => s.id === param || s.code.toUpperCase() === param.toUpperCase());
+  if (index === -1) {
+    return res.status(404).json({ success: false, message: "Store ID not found." });
+  }
+
+  const removed = db.storeIds.splice(index, 1)[0];
+  writeDb(db);
+
+  logAdminAction(req.body?.adminEmail || "SuperAdmin", "STORE_ID_DELETED", `Deleted Store ID ${removed.code} for ${removed.accountEmail}`);
+
+  return res.json({ success: true, message: "Store ID deleted successfully.", removed });
+});
+
+/**
+ * Redeem a 6-character Store ID (Vendor)
+ */
+app.post(['/api/vendor/store-ids/redeem', '/api/vendors/store-ids/redeem'], (req, res) => {
+  const { code, email, vendorId, applicationId } = req.body;
+  if (!code || !email) {
+    return res.status(400).json({ success: false, message: "Store ID code and vendor account email are required." });
+  }
+
+  const cleanCode = code.trim().toUpperCase();
+  const cleanEmail = email.trim().toLowerCase();
+
+  if (cleanCode.length !== 6) {
+    return res.status(400).json({ success: false, message: "Store ID must be exactly 6 characters." });
+  }
+
+  const db = readDb();
+  if (!db.storeIds) db.storeIds = [];
+
+  const storeIdEntry = db.storeIds.find(s => s.code.toUpperCase() === cleanCode);
+  if (!storeIdEntry) {
+    return res.status(404).json({ success: false, message: "Invalid Store ID. Code does not exist." });
+  }
+
+  if (storeIdEntry.isRedeemed || storeIdEntry.status === "used") {
+    return res.status(400).json({ success: false, message: "This Store ID has already been redeemed." });
+  }
+
+  if (storeIdEntry.accountEmail.toLowerCase() !== cleanEmail && storeIdEntry.email?.toLowerCase() !== cleanEmail) {
+    return res.status(403).json({
+      success: false,
+      message: `Email mismatch. This Store ID is bound to "${storeIdEntry.accountEmail}". You are logged in as "${cleanEmail}".`
+    });
+  }
+
+  // Atomically mark Store ID as redeemed
+  storeIdEntry.isRedeemed = true;
+  storeIdEntry.status = "used";
+  storeIdEntry.redeemedAt = Date.now();
+  storeIdEntry.redeemedByVendorId = vendorId || applicationId || `vnd_${cleanEmail}`;
+
+  // Find and activate vendor application
+  const appMatch = db.vendorApplications.find(a =>
+    a.ownerEmail?.toLowerCase() === cleanEmail || (applicationId && a.id === applicationId)
+  );
+  if (appMatch) {
+    appMatch.status = "Active";
+    appMatch.isRegistrationFeePaid = true;
+    appMatch.paymentReference = `STORE_ID_${cleanCode}`;
+    appMatch.paymentAmount = 0;
+  }
+
+  // Find and activate vendor storefront
+  let vendorMatch = db.vendors.find(v =>
+    v.ownerEmail?.toLowerCase() === cleanEmail || (vendorId && v.id === vendorId)
+  );
+  if (vendorMatch) {
+    vendorMatch.status = "Active";
+    vendorMatch.isOpen = true;
+  }
+
+  writeDb(db);
+
+  logAdminAction("SYSTEM", "STORE_ID_REDEEMED", `Store ID ${cleanCode} redeemed by vendor "${cleanEmail}" (Fee waived: ₦1,000)`);
+
+  return res.json({
+    success: true,
+    message: "Store ID redeemed successfully! Your store has been activated for free.",
+    code: cleanCode,
+    email: cleanEmail
+  });
+});
 // Start listening
 app.listen(PORT, () => {
   console.log(`=================================================`);
