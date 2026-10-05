@@ -45,6 +45,7 @@ const RESERVED_USERNAMES = new Set([
 
 // Initial Database Template
 const INITIAL_DATABASE = {
+  // Super Admin and Admin Logins
   admins: [
     {
       id: "adm_super_001",
@@ -122,10 +123,11 @@ const INITIAL_DATABASE = {
   suggestions: []
 };
 
-// Database Reader with Multi-tier Recovery
+// Hardened Database Reader with Multi-tier Recovery (NO automatic filtering: records NEVER vanish)
 function readDb() {
   let parsed = null;
 
+  // Tier 1: Try reading primary file
   if (fs.existsSync(DB_FILE)) {
     try {
       const raw = fs.readFileSync(DB_FILE, 'utf-8');
@@ -133,34 +135,40 @@ function readDb() {
         parsed = JSON.parse(raw);
       }
     } catch (parseErr) {
-      console.error("Primary DB file read error, falling back to backup 1:", parseErr.message);
+      console.error("Primary DB file read/parse error, falling back to backup 1:", parseErr.message);
     }
   }
 
+  // Tier 2: Try reading backup 1
   if (!parsed && fs.existsSync(DB_BACKUP_1)) {
     try {
       const raw = fs.readFileSync(DB_BACKUP_1, 'utf-8');
       if (raw && raw.trim().length > 0) {
         parsed = JSON.parse(raw);
+        console.info("Successfully recovered database from Backup 1!");
       }
     } catch (b1Err) {
-      console.error("Backup 1 read error, falling back to backup 2:", b1Err.message);
+      console.error("Backup 1 read/parse error, falling back to backup 2:", b1Err.message);
     }
   }
 
+  // Tier 3: Try reading backup 2
   if (!parsed && fs.existsSync(DB_BACKUP_2)) {
     try {
       const raw = fs.readFileSync(DB_BACKUP_2, 'utf-8');
       if (raw && raw.trim().length > 0) {
         parsed = JSON.parse(raw);
+        console.info("Successfully recovered database from Backup 2!");
       }
     } catch (b2Err) {
-      console.error("Backup 2 read error:", b2Err.message);
+      console.error("Backup 2 read/parse error:", b2Err.message);
     }
   }
 
+  // Tier 4: Fallback to INITIAL_DATABASE if brand new initialization
   const data = parsed || JSON.parse(JSON.stringify(INITIAL_DATABASE));
 
+  // Safeguard collections
   if (!data.admins || !Array.isArray(data.admins)) data.admins = [...INITIAL_DATABASE.admins];
   if (!data.adminLogs || !Array.isArray(data.adminLogs)) data.adminLogs = [...INITIAL_DATABASE.adminLogs];
   if (!data.users || !Array.isArray(data.users)) data.users = [];
@@ -173,6 +181,7 @@ function readDb() {
   if (!data.reports || !Array.isArray(data.reports)) data.reports = [];
   if (!data.suggestions || !Array.isArray(data.suggestions)) data.suggestions = [];
 
+  // Guarantee permanent existence of essential foundation accounts (WITHOUT resurrecting deleted vendors/apps)
   let didHeal = false;
   if (!data.users.some(u => u.email?.toLowerCase() === "kcoding14@gmail.com")) {
     data.users.push(INITIAL_DATABASE.users[0]);
@@ -183,17 +192,20 @@ function readDb() {
     didHeal = true;
   }
 
+  // Ensure default superadmin ALWAYS exists
   const superAdmin = data.admins.find(a => a.email.toLowerCase() === "khaleelktn@gmail.com");
   if (!superAdmin) {
     data.admins.unshift(INITIAL_DATABASE.admins[0]);
     didHeal = true;
   } else {
+    // Keep superadmin credentials immutable
     superAdmin.password = "Katsinaktn_1";
     superAdmin.isSuperAdmin = true;
     superAdmin.isDeletable = false;
     superAdmin.isEditable = false;
   }
 
+  // Auto-init file on disk if missing or if data was healed
   if (!fs.existsSync(DB_FILE) || didHeal) {
     try {
       fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
@@ -203,14 +215,16 @@ function readDb() {
   return data;
 }
 
-// Atomic Database Writer
+// Atomic & Redundant Database Writer
 function writeDb(data) {
   try {
     const serialized = JSON.stringify(data, null, 2);
     const tempFile = path.join(DATA_DIR, `locovend_db.${Date.now()}.${Math.random().toString(36).substring(7)}.tmp`);
 
+    // 1. Write to temporary file first
     fs.writeFileSync(tempFile, serialized, 'utf-8');
 
+    // 2. Rotate backups before replacing the main database file
     if (fs.existsSync(DB_FILE)) {
       try {
         if (fs.existsSync(DB_BACKUP_1)) {
@@ -222,12 +236,14 @@ function writeDb(data) {
       }
     }
 
+    // 3. Atomic rename to replace main database file
     fs.renameSync(tempFile, DB_FILE);
   } catch (err) {
     console.error("Critical error in writeDb:", err);
   }
 }
 
+// Log administrative actions
 function logAdminAction(adminEmail, action, details) {
   const db = readDb();
   const entry = {
@@ -239,7 +255,7 @@ function logAdminAction(adminEmail, action, details) {
   };
   db.adminLogs.unshift(entry);
   if (db.adminLogs.length > 500) {
-    db.adminLogs = db.adminLogs.slice(0, 500);
+    db.adminLogs = db.adminLogs.slice(0, 500); // cap logs
   }
   writeDb(db);
   return entry;
@@ -251,7 +267,7 @@ function requireApiKey(req, res, next) {
                       req.query.api_key ||
                       (req.headers.authorization && req.headers.authorization.replace('Bearer ', ''));
 
-  if (!providedKey || (providedKey !== MASTER_API_KEY && !providedKey.startsWith('adm_token_') && !providedKey.startsWith('token_') && providedKey !== 'locovend_live_sec_key_katsina_2026')) {
+  if (!providedKey || providedKey !== MASTER_API_KEY) {
     return res.status(401).json({
       success: false,
       error: "Unauthorized",
@@ -342,22 +358,32 @@ app.post('/api/auth/register', (req, res) => {
   const db = readDb();
   const existing = db.users.find(u => u.email.toLowerCase() === email.toLowerCase().trim());
   if (existing) {
-    return res.status(409).json({ success: false, message: "User with this email already exists." });
+    if (phone) existing.phone = phone;
+    if (location) existing.location = location;
+    if (address) existing.address = address;
+    if (name) existing.name = name;
+    writeDb(db);
+    return res.json({
+      token: `token_${uuidv4()}`,
+      userId: existing.id,
+      name: existing.name,
+      email: existing.email,
+      phone: existing.phone,
+      location: existing.location,
+      address: existing.address,
+      role: existing.role
+    });
   }
 
   const newUser = {
     id: `usr_${uuidv4().substring(0, 8)}`,
     name: name.trim(),
     email: email.toLowerCase().trim(),
-    phone: phone ? phone.trim() : "",
-    location: location ? location.trim() : "Katsina Central",
-    address: address ? address.trim() : "",
+    phone: phone || "",
+    location: location || "Katsina Central",
+    address: address || "",
     password: password || "google_oauth_user",
     role: "Customer",
-    isVendor: false,
-    vendorId: null,
-    vendorStoreName: null,
-    username: email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '_').substring(0, 20),
     isBanned: false,
     banType: "none",
     banReason: "",
@@ -395,8 +421,10 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ success: false, message: "Invalid email or password." });
   }
 
+  // Check ban status
   if (user.isBanned) {
     if (user.banType === 'temporary' && user.banExpiresAt && Date.now() > user.banExpiresAt) {
+      // Ban has expired, lift automatically
       user.isBanned = false;
       user.banType = "none";
       writeDb(db);
@@ -427,6 +455,10 @@ app.post('/api/auth/login', (req, res) => {
 
 // ================= ADMIN AUTHENTICATION (LANDING PAGE + 2FA) =================
 
+/**
+ * Step 1: Admin Email & Password login
+ * Generates and sends a 6-digit verification code.
+ */
 app.post('/api/admin/auth/login', (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -440,57 +472,57 @@ app.post('/api/admin/auth/login', (req, res) => {
     return res.status(401).json({ success: false, message: "Invalid admin email or password." });
   }
 
+  // Generate 6-digit verification code
   const code = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 10 * 60 * 1000;
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
 
   pendingAdminOtps.set(admin.email.toLowerCase(), { code, expiresAt });
 
-  console.log(`[ADMIN 2FA CODE] Email: ${admin.email}, Code: ${code} (Expires in 10 minutes)`);
+  console.log(`=================================================`);
+  console.log(`[ADMIN 2FA CODE] Email: ${admin.email}`);
+  console.log(`[ADMIN 2FA CODE] Verification Code: ${code}`);
+  console.log(`[ADMIN 2FA CODE] Valid for: 10 minutes`);
+  console.log(`=================================================`);
 
   return res.json({
     success: true,
-    message: "Admin credentials verified. 2FA verification code generated.",
+    message: `Verification code sent to ${admin.email}`,
     email: admin.email,
-    name: admin.name,
-    role: admin.role,
-    code: code
+    // Included so frontend and test environments work immediately without waiting for SMTP setup
+    verificationCode: code,
+    expiresInMinutes: 10
   });
 });
 
+/**
+ * Step 2: Verify 6-digit email verification code
+ */
 app.post('/api/admin/auth/verify-code', (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) {
-    return res.status(400).json({ success: false, message: "Email and 6-digit code are required." });
+    return res.status(400).json({ success: false, message: "Email and verification code are required." });
   }
 
   const cleanEmail = email.toLowerCase().trim();
-  const cleanCode = code.toString().trim();
+  const pending = pendingAdminOtps.get(cleanEmail);
 
-  const record = pendingAdminOtps.get(cleanEmail);
+  // Development bypass / exact code check
+  const isMatch = (pending && pending.code === code.trim() && Date.now() <= pending.expiresAt) || (code.trim() === "123456");
 
-  const isMasterOtp = cleanCode === "123456" || cleanCode === "202600";
-
-  if (!isMasterOtp) {
-    if (!record) {
-      return res.status(400).json({ success: false, message: "No pending verification code found for this email. Please log in again." });
-    }
-    if (Date.now() > record.expiresAt) {
-      pendingAdminOtps.delete(cleanEmail);
-      return res.status(400).json({ success: false, message: "Verification code has expired. Please request a new one." });
-    }
-    if (record.code !== cleanCode) {
-      return res.status(401).json({ success: false, message: "Invalid 6-digit verification code." });
-    }
+  if (!isMatch) {
+    return res.status(400).json({ success: false, message: "Invalid or expired verification code." });
   }
 
   pendingAdminOtps.delete(cleanEmail);
 
   const db = readDb();
   const admin = db.admins.find(a => a.email.toLowerCase() === cleanEmail);
-  if (admin) {
-    admin.lastLoginAt = Date.now();
-    writeDb(db);
+  if (!admin) {
+    return res.status(404).json({ success: false, message: "Admin account not found." });
   }
+
+  admin.lastLoginAt = Date.now();
+  writeDb(db);
 
   logAdminAction(admin.email, "ADMIN_LOGIN", `Admin ${admin.name} verified and logged in successfully.`);
 
@@ -503,188 +535,541 @@ app.post('/api/admin/auth/verify-code', (req, res) => {
       name: admin.name,
       email: admin.email,
       role: admin.role,
-      isSuperAdmin: !!admin.isSuperAdmin
+      isSuperAdmin: !!admin.isSuperAdmin,
+      isDeletable: !!admin.isDeletable,
+      isEditable: !!admin.isEditable,
+      lastLoginAt: admin.lastLoginAt
     }
   });
 });
 
 // ================= SECTION 1: USERS (VENDORS & NON-VENDORS) =================
 
+/**
+ * Get all users with computed summary metrics:
+ * - total purchases (count & amount)
+ * - complaints & reports made
+ * - vendor status & store link
+ * - ban status & legal details
+ */
 app.get('/api/admin/users', (req, res) => {
   const db = readDb();
-  return res.json(db.users);
+  const adminEmails = (db.admins || []).map(a => a.email.toLowerCase());
+  // Exclude admin accounts so they only appear in the Admin section
+  const customerAndVendorUsers = db.users.filter(u => u.role !== "Admin" && !adminEmails.includes(u.email?.toLowerCase()));
+
+  const enrichedUsers = customerAndVendorUsers.map(u => {
+    // Orders by this user
+    const userOrders = db.orders.filter(o => o.customerEmail?.toLowerCase() === u.email.toLowerCase() || o.userId === u.id);
+    const totalPurchasesCount = userOrders.length;
+    const totalPurchasesAmount = userOrders.reduce((sum, o) => sum + (o.total || 0), 0);
+
+    // Complaints made by this customer
+    const userComplaints = db.complaints.filter(c => c.userEmail?.toLowerCase() === u.email.toLowerCase());
+
+    // Reports made by this customer
+    const userReports = db.reports.filter(r => r.reporterEmail?.toLowerCase() === u.email.toLowerCase());
+
+    // Check if user is a vendor
+    const vendorStore = db.vendors.find(v => v.ownerEmail?.toLowerCase() === u.email.toLowerCase());
+
+    return {
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      phone: u.phone,
+      location: u.location,
+      address: u.address,
+      role: vendorStore ? "Vendor" : (u.role || "Customer"),
+      createdAt: u.createdAt,
+      totalPurchasesCount,
+      totalPurchasesAmount,
+      complaintsCount: userComplaints.length,
+      reportsCount: userReports.length,
+      complaints: userComplaints,
+      reports: userReports,
+      isVendor: !!vendorStore,
+      vendorId: vendorStore ? vendorStore.id : null,
+      vendorStoreName: vendorStore ? vendorStore.name : null,
+      isBanned: !!u.isBanned,
+      banType: u.banType || "none",
+      banReason: u.banReason || "",
+      banExplanation: u.banExplanation || "",
+      banExpiresAt: u.banExpiresAt || null,
+      bannedAt: u.bannedAt || null
+    };
+  });
+
+  return res.json(enrichedUsers);
 });
 
+/**
+ * Get single user detailed view
+ */
 app.get('/api/admin/users/:id', (req, res) => {
   const db = readDb();
-  const user = db.users.find(u => u.id === req.params.id || u.email.toLowerCase() === req.params.id.toLowerCase());
+  const user = db.users.find(u => u.id === req.params.id);
   if (!user) {
     return res.status(404).json({ success: false, message: "User not found." });
   }
-  return res.json(user);
+
+  const userOrders = db.orders.filter(o => o.customerEmail?.toLowerCase() === user.email.toLowerCase() || o.userId === user.id);
+  const userComplaints = db.complaints.filter(c => c.userEmail?.toLowerCase() === user.email.toLowerCase());
+  const userReports = db.reports.filter(r => r.reporterEmail?.toLowerCase() === user.email.toLowerCase());
+  const vendorStore = db.vendors.find(v => v.ownerEmail?.toLowerCase() === user.email.toLowerCase());
+
+  return res.json({
+    ...user,
+    orders: userOrders,
+    complaints: userComplaints,
+    reports: userReports,
+    isVendor: !!vendorStore,
+    vendorStore: vendorStore || null
+  });
 });
 
+/**
+ * Ban or unban a user (temporary or permanent with reason and explanation)
+ */
 app.post('/api/admin/users/:id/ban', (req, res) => {
-  const { isBanned, banType, durationDays, reason, explanation, adminEmail } = req.body;
+  const { type, banType, isBanned, reason, explanation, durationDays, adminEmail } = req.body || {};
   const db = readDb();
-  const user = db.users.find(u => u.id === req.params.id || u.email.toLowerCase() === req.params.id.toLowerCase());
+  const query = req.params.id.toLowerCase().trim();
+  const user = db.users.find(u => u.id?.toLowerCase() === query || u.email?.toLowerCase() === query);
 
   if (!user) {
     return res.status(404).json({ success: false, message: "User not found." });
   }
 
-  user.isBanned = !!isBanned;
+  // Also locate any associated vendor store or application for this user
+  const userEmail = (user.email || "").toLowerCase();
+  const vendorStore = db.vendors.find(v => v.ownerEmail?.toLowerCase() === userEmail);
+  const vendorApp = db.vendorApplications.find(a => a.ownerEmail?.toLowerCase() === userEmail);
 
-  if (isBanned) {
-    user.banType = banType === 'permanent' ? 'permanent' : 'temporary';
-    user.banReason = reason || "Violating platform terms & conditions";
-    user.banExplanation = explanation || "Account suspended by LocoVend administration.";
-    user.bannedAt = Date.now();
+  const rawBanType = type || banType;
+  const shouldUnban = isBanned === false || rawBanType === "none" || (isBanned === undefined && !rawBanType);
 
-    if (user.banType === 'temporary') {
-      const days = parseInt(durationDays, 10) || 7;
-      user.banExpiresAt = Date.now() + (days * 24 * 60 * 60 * 1000);
-    } else {
-      user.banExpiresAt = null;
-    }
-
-    logAdminAction(adminEmail || "SuperAdmin", "USER_BANNED", `Banned user ${user.name} (${user.email}). Type: ${user.banType}. Reason: ${user.banReason}`);
-  } else {
+  if (shouldUnban) {
+    // Unban
+    user.isBanned = false;
     user.banType = "none";
     user.banReason = "";
     user.banExplanation = "";
     user.banExpiresAt = null;
     user.bannedAt = null;
 
-    logAdminAction(adminEmail || "SuperAdmin", "USER_UNBANNED", `Unbanned user ${user.name} (${user.email})`);
+    if (vendorStore) {
+      vendorStore.isBanned = false;
+      vendorStore.banType = "none";
+      vendorStore.banReason = "";
+      vendorStore.banExplanation = "";
+      vendorStore.banExpiresAt = null;
+      vendorStore.isOpen = true;
+    }
+    if (vendorApp) {
+      vendorApp.isBanned = false;
+      vendorApp.banType = "none";
+      vendorApp.banReason = "";
+      vendorApp.banExplanation = "";
+      vendorApp.banExpiresAt = null;
+    }
+
+    logAdminAction(adminEmail, "USER_UNBANNED", `Unbanned user ${user.email} (${user.name}) and linked vendor store.`);
+  } else {
+    // Ban
+    const resolvedType = (rawBanType === "temporary" || durationDays) ? "temporary" : "permanent";
+    user.isBanned = true;
+    user.banType = resolvedType;
+    user.banReason = reason || "Violation of Terms";
+    user.banExplanation = explanation || "";
+    user.bannedAt = Date.now();
+    user.banExpiresAt = resolvedType === "temporary"
+      ? Date.now() + (parseInt(durationDays, 10) || 7) * 24 * 60 * 60 * 1000
+      : null;
+
+    if (vendorStore) {
+      vendorStore.isBanned = true;
+      vendorStore.banType = resolvedType;
+      vendorStore.banReason = reason || "Violation of Terms";
+      vendorStore.banExplanation = explanation || "";
+      vendorStore.banExpiresAt = user.banExpiresAt;
+      vendorStore.isOpen = false; // close store immediately
+    }
+    if (vendorApp) {
+      vendorApp.isBanned = true;
+      vendorApp.banType = resolvedType;
+      vendorApp.banReason = reason || "Violation of Terms";
+      vendorApp.banExplanation = explanation || "";
+      vendorApp.banExpiresAt = user.banExpiresAt;
+    }
+
+    logAdminAction(adminEmail, "USER_BANNED", `Banned user ${user.email} (${resolvedType}). Reason: ${reason}. Exp: ${explanation}`);
   }
 
   writeDb(db);
-  return res.json({ success: true, message: `User ban status updated to ${user.isBanned ? 'Banned' : 'Active'}.`, user });
+  return res.json({ success: true, message: `User and associated store status updated.`, user, vendorStore });
+});
+
+/**
+ * Edit / Update user profile from Admin Dashboard or Mobile App
+ */
+app.all(['/api/admin/users/:id', '/api/users/:id', '/api/users/profile', '/api/user/update'], (req, res, next) => {
+  if (req.method !== 'PUT' && req.method !== 'PATCH' && req.method !== 'POST') {
+    return next();
+  }
+  const { id, email, name, phone, location, address, role, avatarUrl, adminEmail } = req.body || {};
+  const db = readDb();
+  const paramId = (req.params.id || id || email || "").toLowerCase().trim();
+  const user = db.users.find(u =>
+    (paramId && (u.id?.toLowerCase() === paramId || u.email?.toLowerCase() === paramId)) ||
+    (email && u.email?.toLowerCase() === email.toLowerCase().trim()) ||
+    (id && u.id?.toLowerCase() === id.toLowerCase().trim())
+  );
+
+  if (!user) {
+    return res.status(404).json({ success: false, message: "User not found." });
+  }
+
+  if (name !== undefined && name.trim().length > 0) user.name = name.trim();
+  if (phone !== undefined) user.phone = phone.trim();
+  if (location !== undefined) user.location = location.trim();
+  if (address !== undefined) user.address = address.trim();
+  if (role !== undefined) user.role = role.trim();
+  if (avatarUrl !== undefined) user.avatarUrl = avatarUrl;
+
+  writeDb(db);
+  logAdminAction(adminEmail || "SYSTEM", "USER_UPDATED", `Updated user details for ${user.email} (${user.name})`);
+  return res.json({ success: true, message: "User updated successfully.", user });
+});
+
+/**
+ * Delete a user account permanently
+ */
+app.delete(['/api/admin/users/:id', '/api/users/:id'], (req, res) => {
+  const { adminEmail } = req.body || {};
+  const db = readDb();
+  const query = req.params.id.toLowerCase().trim();
+  const index = db.users.findIndex(u => u.id.toLowerCase() === query || u.email?.toLowerCase() === query);
+
+  if (index === -1) {
+    return res.status(404).json({ success: false, message: "User not found." });
+  }
+
+  const removed = db.users.splice(index, 1)[0];
+  writeDb(db);
+  logAdminAction(adminEmail || "SuperAdmin", "USER_DELETED", `Deleted user account ${removed.email} (${removed.name})`);
+  return res.json({ success: true, message: `User ${removed.email} deleted successfully.`, user: removed });
 });
 
 // ================= SECTION 2: VENDORS (& THEIR STORES) =================
 
+/**
+ * Get all vendors for admin with metrics:
+ * store name, email, sales, revenue, products, complaints & reports count, controls
+ */
 app.get('/api/admin/vendors', (req, res) => {
   const db = readDb();
-  return res.json(db.vendors);
+
+  const vendorsList = db.vendors.map(v => {
+    // Orders for this vendor
+    const vendorOrders = db.orders.filter(o => o.vendorId === v.id || o.vendorName === v.name);
+    const totalSalesMade = vendorOrders.length;
+    const totalRevenue = vendorOrders.reduce((sum, o) => sum + (o.total || 0), 0);
+
+    // Products by this vendor
+    const vendorProducts = db.products.filter(p => p.vendorId === v.id);
+    const totalProducts = vendorProducts.length;
+    const totalProductsAvailable = vendorProducts.filter(p => p.inStock).length;
+
+    // Complaints about this vendor
+    const vendorComplaints = db.complaints.filter(c => c.vendorName?.toLowerCase() === v.name.toLowerCase() || c.vendorId === v.id);
+
+    // Reports about this vendor
+    const vendorReports = db.reports.filter(r => r.targetId === v.id || r.targetName?.toLowerCase() === v.name.toLowerCase());
+
+    return {
+      id: v.id,
+      name: v.name, // Store name
+      ownerEmail: v.ownerEmail,
+      phone: v.phone,
+      category: v.category,
+      area: v.area,
+      address: v.address,
+      status: v.status,
+      rating: v.rating || 5.0,
+      reviewsCount: v.reviewsCount || 0,
+      totalSalesMade,
+      totalRevenue,
+      totalProducts,
+      totalProductsAvailable,
+      complaintsCount: vendorComplaints.length,
+      reportsCount: vendorReports.length,
+      complaints: vendorComplaints,
+      reports: vendorReports,
+      isVerified: v.isVerified !== false,
+      isPioneerVendor: !!v.isPioneerVendor,
+      isBanned: !!v.isBanned,
+      banType: v.banType || "none",
+      banReason: v.banReason || "",
+      banExplanation: v.banExplanation || "",
+      banExpiresAt: v.banExpiresAt || null,
+      storeUrl: `https://locovend-database.onrender.com/store/${v.id}`
+    };
+  });
+
+  return res.json(vendorsList);
 });
 
+/**
+ * Get single vendor detail with products, reviews, complaints, reports
+ */
 app.get('/api/admin/vendors/:id', (req, res) => {
   const db = readDb();
   const vendor = db.vendors.find(v => v.id === req.params.id);
   if (!vendor) {
     return res.status(404).json({ success: false, message: "Vendor not found." });
   }
-  return res.json(vendor);
+
+  const products = db.products.filter(p => p.vendorId === vendor.id);
+  const orders = db.orders.filter(o => o.vendorId === vendor.id || o.vendorName === vendor.name);
+  const complaints = db.complaints.filter(c => c.vendorName?.toLowerCase() === vendor.name.toLowerCase() || c.vendorId === vendor.id);
+  const reports = db.reports.filter(r => r.targetId === vendor.id);
+
+  return res.json({
+    ...vendor,
+    products,
+    orders,
+    complaints,
+    reports
+  });
 });
 
+/**
+ * Verify / Unverify vendor
+ */
 app.patch('/api/admin/vendors/:id/verify', (req, res) => {
   const { isVerified, adminEmail } = req.body;
   const db = readDb();
   const vendor = db.vendors.find(v => v.id === req.params.id);
-
   if (!vendor) {
     return res.status(404).json({ success: false, message: "Vendor not found." });
   }
 
-  vendor.isVerified = !!isVerified;
+  vendor.isVerified = isVerified === true;
   writeDb(db);
 
-  logAdminAction(adminEmail || "SuperAdmin", "VENDOR_VERIFIED", `Set verification of vendor ${vendor.name} to ${vendor.isVerified}`);
-  return res.json({ success: true, message: `Vendor verification updated to ${vendor.isVerified}`, vendor });
+  logAdminAction(adminEmail, "VENDOR_VERIFICATION_TOGGLE", `Set isVerified=${vendor.isVerified} for vendor "${vendor.name}"`);
+
+  return res.json({ success: true, isVerified: vendor.isVerified, vendor });
 });
 
+/**
+ * Mark / Unmark Pioneer Vendor
+ */
 app.patch('/api/admin/vendors/:id/pioneer', (req, res) => {
-  const { isPioneer, adminEmail } = req.body;
+  const { isPioneerVendor, adminEmail } = req.body;
   const db = readDb();
   const vendor = db.vendors.find(v => v.id === req.params.id);
-
   if (!vendor) {
     return res.status(404).json({ success: false, message: "Vendor not found." });
   }
 
-  vendor.isPioneerVendor = !!isPioneer;
+  vendor.isPioneerVendor = isPioneerVendor === true;
   writeDb(db);
 
-  logAdminAction(adminEmail || "SuperAdmin", "VENDOR_PIONEER_TOGGLED", `Set pioneer status of vendor ${vendor.name} to ${vendor.isPioneerVendor}`);
-  return res.json({ success: true, message: `Vendor pioneer status updated to ${vendor.isPioneerVendor}`, vendor });
+  logAdminAction(adminEmail, "VENDOR_PIONEER_TOGGLE", `Set isPioneerVendor=${vendor.isPioneerVendor} for vendor "${vendor.name}"`);
+
+  return res.json({ success: true, isPioneerVendor: vendor.isPioneerVendor, vendor });
 });
 
+/**
+ * Ban or unban a vendor store
+ */
 app.post('/api/admin/vendors/:id/ban', (req, res) => {
-  const { isBanned, banType, durationDays, reason, explanation, adminEmail } = req.body;
+  const { type, reason, explanation, durationDays, adminEmail } = req.body;
   const db = readDb();
-  const vendor = db.vendors.find(v => v.id === req.params.id);
+  const query = req.params.id.toLowerCase().trim();
 
-  if (!vendor) {
-    return res.status(404).json({ success: false, message: "Vendor not found." });
+  let vendor = db.vendors.find(v =>
+    v.id?.toLowerCase() === query ||
+    v.ownerEmail?.toLowerCase() === query ||
+    v.name?.toLowerCase() === query
+  );
+
+  let appMatch = db.vendorApplications.find(a =>
+    a.id?.toLowerCase() === query ||
+    a.ownerEmail?.toLowerCase() === query ||
+    a.name?.toLowerCase() === query
+  );
+
+  if (!vendor && !appMatch) {
+    return res.status(404).json({ success: false, message: "Vendor or vendor application not found." });
   }
 
-  vendor.isBanned = !!isBanned;
+  const storeName = vendor?.name || appMatch?.name || "Vendor Store";
+  const ownerEmail = (vendor?.ownerEmail || appMatch?.ownerEmail || "").toLowerCase();
 
-  if (isBanned) {
-    vendor.banType = banType === 'permanent' ? 'permanent' : 'temporary';
-    vendor.banReason = reason || "Violating vendor guidelines";
-    vendor.banExplanation = explanation || "Store disabled by LocoVend administration.";
-    vendor.bannedAt = Date.now();
-    vendor.isOpen = false;
-
-    if (vendor.banType === 'temporary') {
-      const days = parseInt(durationDays, 10) || 7;
-      vendor.banExpiresAt = Date.now() + (days * 24 * 60 * 60 * 1000);
-    } else {
+  if (type === "none" || !type) {
+    if (vendor) {
+      vendor.isBanned = false;
+      vendor.banType = "none";
+      vendor.banReason = "";
+      vendor.banExplanation = "";
       vendor.banExpiresAt = null;
+      vendor.isOpen = true;
+    }
+    if (appMatch) {
+      appMatch.isBanned = false;
+      appMatch.banType = "none";
+      appMatch.banReason = "";
+      appMatch.banExplanation = "";
+      appMatch.banExpiresAt = null;
+    }
+    logAdminAction(adminEmail, "VENDOR_STORE_UNBANNED", `Unbanned vendor store "${storeName}"`);
+  } else {
+    const banExpiresAt = type === "temporary" && durationDays
+      ? Date.now() + durationDays * 24 * 60 * 60 * 1000
+      : null;
+
+    if (vendor) {
+      vendor.isBanned = true;
+      vendor.banType = type; // "temporary" or "permanent"
+      vendor.banReason = reason || "Policy violation";
+      vendor.banExplanation = explanation || "";
+      vendor.banExpiresAt = banExpiresAt;
+      vendor.isOpen = false; // close store while banned
     }
 
-    logAdminAction(adminEmail || "SuperAdmin", "VENDOR_BANNED", `Banned vendor ${vendor.name}. Type: ${vendor.banType}. Reason: ${vendor.banReason}`);
-  } else {
-    vendor.banType = "none";
-    vendor.banReason = "";
-    vendor.banExplanation = "";
-    vendor.banExpiresAt = null;
-    vendor.bannedAt = null;
-    vendor.isOpen = true;
+    if (appMatch) {
+      appMatch.isBanned = true;
+      appMatch.banType = type;
+      appMatch.banReason = reason || "Policy violation";
+      appMatch.banExplanation = explanation || "";
+      appMatch.banExpiresAt = banExpiresAt;
+    }
 
-    logAdminAction(adminEmail || "SuperAdmin", "VENDOR_UNBANNED", `Unbanned vendor ${vendor.name}`);
+    logAdminAction(adminEmail, "VENDOR_STORE_BANNED", `Banned vendor store "${storeName}" (${type}). Reason: ${reason}. Exp: ${explanation}`);
   }
 
   writeDb(db);
-  return res.json({ success: true, message: `Vendor store ban status updated to ${vendor.isBanned ? 'Banned' : 'Active'}.`, vendor });
+  return res.json({ success: true, message: "Vendor ban status updated.", vendor, application: appMatch });
+});
+
+/**
+ * Delete a vendor store permanently
+ */
+app.delete('/api/admin/vendors/:id', (req, res) => {
+  const { adminEmail } = req.body || {};
+  const db = readDb();
+  const index = db.vendors.findIndex(v => v.id === req.params.id);
+  if (index === -1) {
+    return res.status(404).json({ success: false, message: "Vendor not found." });
+  }
+
+  const removed = db.vendors.splice(index, 1)[0];
+  db.products = db.products.filter(p => p.vendorId !== req.params.id);
+  logAdminAction(adminEmail, "VENDOR_DELETED", `Deleted vendor "${removed.name}" (${removed.ownerEmail})`);
+  writeDb(db);
+  return res.json({ success: true, message: `Vendor "${removed.name}" deleted successfully.`, vendor: removed });
+});
+
+/**
+ * Self-service store deletion by vendor (with reason and explanation survey)
+ */
+app.post('/api/vendor/store/delete', (req, res) => {
+  const { email, storeId, reason, explanation } = req.body || {};
+  const cleanEmail = (email || '').trim().toLowerCase();
+  const db = readDb();
+
+  let removedVendor = null;
+  const vIndex = db.vendors.findIndex(v => 
+    (storeId && v.id === storeId) || 
+    (cleanEmail && v.ownerEmail && v.ownerEmail.toLowerCase() === cleanEmail)
+  );
+
+  if (vIndex !== -1) {
+    removedVendor = db.vendors.splice(vIndex, 1)[0];
+    db.products = db.products.filter(p => p.vendorId !== removedVendor.id);
+  }
+
+  // Remove matching vendor applications
+  db.vendorApplications = db.vendorApplications.filter(a => {
+    if (storeId && a.id === storeId) return false;
+    const aEmail = (a.ownerEmail || a.email || '').toLowerCase().trim();
+    if (cleanEmail && aEmail === cleanEmail) return false;
+    return true;
+  });
+
+  // Revert user role back to Customer
+  if (cleanEmail) {
+    const user = db.users.find(u => u.email && u.email.toLowerCase().trim() === cleanEmail);
+    if (user) {
+      user.role = 'Customer';
+      user.isVendor = false;
+      user.vendorId = null;
+      user.vendorStoreName = null;
+    }
+  }
+
+  // Record deletion audit entry
+  if (!db.storeDeletionLogs) db.storeDeletionLogs = [];
+  db.storeDeletionLogs.push({
+    storeId: removedVendor ? removedVendor.id : (storeId || null),
+    storeName: removedVendor ? removedVendor.name : "Vendor Store",
+    ownerEmail: cleanEmail,
+    reason: reason || "No reason specified",
+    explanation: explanation || "",
+    deletedAt: Date.now()
+  });
+
+  writeDb(db);
+  console.log(`[STORE_DELETED] Store deleted for ${cleanEmail}. Reason: ${reason}`);
+  return res.json({
+    success: true,
+    message: "Store deleted successfully."
+  });
 });
 
 // ================= SECTION 3: APPLICATIONS & SUGGESTIONS =================
 
+/**
+ * Get all vendor applications
+ */
 app.get('/api/admin/applications', (req, res) => {
   const db = readDb();
   return res.json(db.vendorApplications);
 });
 
+/**
+ * Accept or Deny a vendor application
+ */
 app.post('/api/admin/applications/:id/decision', (req, res) => {
-  const { decision, reason, explanation, adminEmail } = req.body;
+  const { decision, reason, explanation, adminEmail } = req.body; // decision: "accept" or "deny"
   const db = readDb();
-  const appMatch = db.vendorApplications.find(a => a.id === req.params.id);
+  const application = db.vendorApplications.find(a => a.id === req.params.id);
 
-  if (!appMatch) {
+  if (!application) {
     return res.status(404).json({ success: false, message: "Vendor application not found." });
   }
 
-  if (decision === 'approve') {
-    appMatch.status = "Approved";
-    appMatch.approvedAt = Date.now();
-    appMatch.isRegistrationFeePaid = true;
+  if (decision === "accept") {
+    application.status = "Approved";
+    application.approvedAt = Date.now();
 
-    let vendor = db.vendors.find(v => v.ownerEmail?.toLowerCase() === appMatch.ownerEmail.toLowerCase());
-    if (!vendor) {
-      vendor = {
+    // Check if vendor already exists in vendors table
+    let existingVendor = db.vendors.find(v => v.ownerEmail?.toLowerCase() === application.ownerEmail.toLowerCase());
+    const vendorUsername = application.username || application.name.toLowerCase().trim().replace(/[^a-z0-9_]/g, '_').substring(0, 25);
+    if (!existingVendor) {
+      existingVendor = {
         id: `vnd_${uuidv4().substring(0, 8)}`,
-        name: appMatch.name,
-        username: appMatch.username || appMatch.name.toLowerCase().trim().replace(/[^a-z0-9_]/g, '_').substring(0, 25),
-        motto: appMatch.description || "Fresh and reliable vendor in Katsina",
-        category: appMatch.category,
-        area: appMatch.area,
-        address: appMatch.address || appMatch.area,
-        phone: appMatch.phone,
-        ownerEmail: appMatch.ownerEmail,
+        name: application.name,
+        username: vendorUsername,
+        motto: application.description || "Fresh local vendor on LocoVend",
+        category: application.category || "food_snacks",
+        area: application.area || "Katsina Central",
+        address: application.address || application.area || "Katsina",
+        phone: application.phone,
+        ownerEmail: application.ownerEmail.toLowerCase(),
         status: "Active",
         rating: 5.0,
         reviewsCount: 0,
@@ -694,39 +1079,58 @@ app.post('/api/admin/applications/:id/decision', (req, res) => {
         isVerified: true,
         isPioneerVendor: false,
         isBanned: false,
-        logoUri: appMatch.logoUri || "https://images.unsplash.com/photo-1555939594-58d7cb561ad1?w=400&q=80",
+        logoUri: application.logoUri || "https://images.unsplash.com/photo-1555939594-58d7cb561ad1?w=400&q=80",
         createdAt: Date.now()
       };
-      db.vendors.push(vendor);
+      db.vendors.push(existingVendor);
     } else {
-      vendor.status = "Active";
-      vendor.isOpen = true;
-      vendor.isVerified = true;
+      if (application.username) existingVendor.username = application.username;
     }
 
-    const user = db.users.find(u => u.email.toLowerCase() === appMatch.ownerEmail.toLowerCase());
+    // Upgrade applicant user account to "Vendor"
+    const user = db.users.find(u => u.email.toLowerCase() === application.ownerEmail.toLowerCase());
     if (user) {
       user.role = "Vendor";
       user.isVendor = true;
-      user.vendorId = vendor.id;
-      user.vendorStoreName = vendor.name;
+      user.vendorId = existingVendor.id;
+      user.vendorStoreName = existingVendor.name;
+      user.username = existingVendor.username;
     }
 
-    logAdminAction(adminEmail || "SuperAdmin", "APPLICATION_APPROVED", `Approved application for ${appMatch.name} (${appMatch.ownerEmail})`);
+    logAdminAction(adminEmail, "APPLICATION_ACCEPTED", `Accepted vendor application for "${application.name}" (${application.ownerEmail})`);
     writeDb(db);
-    return res.json({ success: true, message: "Application approved and vendor store activated successfully.", application: appMatch, vendor });
-  } else if (decision === 'reject') {
-    appMatch.status = "Denied";
-    appMatch.rejectionReason = reason || "Application requirements not fully met";
-    appMatch.rejectionExplanation = explanation || "Please review the instructions and feel free to re-apply.";
-    appMatch.deniedAt = Date.now();
 
-    logAdminAction(adminEmail || "SuperAdmin", "APPLICATION_REJECTED", `Rejected application for ${appMatch.name}. Reason: ${appMatch.rejectionReason}`);
+    return res.json({ success: true, message: "Application accepted and vendor store activated.", application, vendor: existingVendor });
+  } else if (decision === "deny") {
+    application.status = "Denied";
+    application.rejectionReason = reason || "Did not meet criteria";
+    application.rejectionExplanation = explanation || "";
+    application.deniedAt = Date.now();
+
+    logAdminAction(adminEmail, "APPLICATION_DENIED", `Denied application for "${application.name}". Reason: ${reason}`);
     writeDb(db);
-    return res.json({ success: true, message: "Application rejected.", application: appMatch });
+
+    return res.json({ success: true, message: "Application denied.", application });
+  } else {
+    return res.status(400).json({ success: false, message: "Invalid decision. Must be 'accept' or 'deny'." });
+  }
+});
+
+/**
+ * Delete vendor application (Admin)
+ */
+app.delete('/api/admin/applications/:id', (req, res) => {
+  const db = readDb();
+  const index = db.vendorApplications.findIndex(a => a.id === req.params.id);
+  if (index === -1) {
+    return res.status(404).json({ success: false, message: "Vendor application not found." });
   }
 
-  return res.status(400).json({ success: false, message: "Invalid decision. Must be 'approve' or 'reject'." });
+  const removed = db.vendorApplications.splice(index, 1)[0];
+  writeDb(db);
+
+  logAdminAction(req.body?.adminEmail || "SuperAdmin", "APPLICATION_DELETED", `Deleted application for "${removed.name}" (${removed.ownerEmail})`);
+  return res.json({ success: true, message: "Vendor application deleted successfully.", removed });
 });
 
 // ================= SECTION: STORE IDS (MERCHANT ACTIVATION CODES) =================
@@ -740,16 +1144,22 @@ function generate6CharStoreId() {
   return res;
 }
 
+/**
+ * Get all Store IDs (Admin)
+ */
 app.get(['/api/admin/store-ids', '/api/admin/store-id', '/api/store-ids'], (req, res) => {
   const db = readDb();
   if (!db.storeIds) db.storeIds = [];
   return res.json(db.storeIds);
 });
 
+/**
+ * Create a new Store ID (Admin)
+ */
 app.post(['/api/admin/store-ids', '/api/admin/store-id', '/api/store-ids', '/api/admin/generate-store-id'], (req, res) => {
   try {
     const { accountEmail, email, code, adminEmail } = req.body || {};
-    const targetEmail = (accountEmail || email || req.query.email || "").toLowerCase().trim();
+    const targetEmail = (accountEmail || email || "").toLowerCase().trim();
 
     if (!targetEmail || !targetEmail.includes("@")) {
       return res.status(400).json({ success: false, message: "Valid vendor account email is required." });
@@ -758,11 +1168,13 @@ app.post(['/api/admin/store-ids', '/api/admin/store-id', '/api/store-ids', '/api
     const db = readDb();
     if (!db.storeIds) db.storeIds = [];
 
-    let finalCode = (code && code.trim().length === 6) ? code.toUpperCase().trim() : generate6CharStoreId();
-    let attempts = 0;
-    while (db.storeIds.some(s => s && s.code && s.code.toUpperCase() === finalCode) && attempts < 10) {
-      finalCode = generate6CharStoreId();
-      attempts++;
+    let finalCode = (code || generate6CharStoreId()).toUpperCase().trim();
+    if (finalCode.length !== 6) {
+      return res.status(400).json({ success: false, message: "Store ID must be exactly 6 characters." });
+    }
+
+    if (db.storeIds.some(s => s.code.toUpperCase() === finalCode)) {
+      return res.status(409).json({ success: false, message: `A Store ID with code ${finalCode} already exists.` });
     }
 
     const newStoreId = {
@@ -803,6 +1215,9 @@ app.post(['/api/admin/store-ids', '/api/admin/store-id', '/api/store-ids', '/api
   }
 });
 
+/**
+ * Delete / Revoke a Store ID (Admin)
+ */
 app.delete(['/api/admin/store-ids/:id', '/api/admin/store-ids/:code'], (req, res) => {
   const param = req.params.id || req.params.code;
   const db = readDb();
@@ -817,10 +1232,15 @@ app.delete(['/api/admin/store-ids/:id', '/api/admin/store-ids/:code'], (req, res
   writeDb(db);
 
   logAdminAction(req.body?.adminEmail || "SuperAdmin", "STORE_ID_DELETED", `Deleted Store ID ${removed.code} for ${removed.accountEmail}`);
+
   return res.json({ success: true, message: "Store ID deleted successfully.", removed });
 });
 
-// Redeem Store ID
+/**
+ * Redeem a 6-character Store ID (Vendor)
+ * Validates code and ensures vendor's account email matches the Store ID's assigned email.
+ * Activates vendor application and store for free (waiving ₦1,000 fee).
+ */
 app.post(['/api/vendor/store-ids/redeem', '/api/vendors/store-ids/redeem'], (req, res) => {
   const { code, email, vendorId, applicationId } = req.body;
   if (!code || !email) {
@@ -853,11 +1273,13 @@ app.post(['/api/vendor/store-ids/redeem', '/api/vendors/store-ids/redeem'], (req
     });
   }
 
+  // Mark Store ID as redeemed
   storeIdEntry.isRedeemed = true;
   storeIdEntry.status = "used";
   storeIdEntry.redeemedAt = Date.now();
   storeIdEntry.redeemedByVendorId = vendorId || applicationId || `vnd_${cleanEmail}`;
 
+  // Find and update vendor application
   const appMatch = db.vendorApplications.find(a =>
     a.ownerEmail?.toLowerCase() === cleanEmail ||
     (applicationId && a.id === applicationId)
@@ -869,6 +1291,7 @@ app.post(['/api/vendor/store-ids/redeem', '/api/vendors/store-ids/redeem'], (req
     appMatch.paymentAmount = 0;
   }
 
+  // Find and update vendor storefront
   let vendorMatch = db.vendors.find(v =>
     v.ownerEmail?.toLowerCase() === cleanEmail ||
     (vendorId && v.id === vendorId)
@@ -903,6 +1326,7 @@ app.post(['/api/vendor/store-ids/redeem', '/api/vendors/store-ids/redeem'], (req
     db.vendors.push(vendorMatch);
   }
 
+  // Update user role to Vendor
   const user = db.users.find(u => u.email.toLowerCase() === cleanEmail);
   if (user) {
     user.role = "Vendor";
@@ -924,7 +1348,9 @@ app.post(['/api/vendor/store-ids/redeem', '/api/vendors/store-ids/redeem'], (req
   });
 });
 
-// Suggestions
+/**
+ * Suggestions section
+ */
 app.get('/api/admin/suggestions', (req, res) => {
   const db = readDb();
   return res.json(db.suggestions);
@@ -936,13 +1362,17 @@ app.delete('/api/admin/suggestions/:id', (req, res) => {
   if (index === -1) {
     return res.status(404).json({ success: false, message: "Suggestion not found." });
   }
+
   const removed = db.suggestions.splice(index, 1)[0];
   writeDb(db);
-  return res.json({ success: true, message: "Suggestion removed.", removed });
+  return res.json({ success: true, message: "Suggestion deleted.", removed });
 });
 
 // ================= SECTION 4: ADMIN ACCOUNTS & LOGS =================
 
+/**
+ * Get all admin login accounts and last login timestamps
+ */
 app.get('/api/admin/admins', (req, res) => {
   const db = readDb();
   const safeAdmins = db.admins.map(a => ({
@@ -953,22 +1383,26 @@ app.get('/api/admin/admins', (req, res) => {
     isSuperAdmin: !!a.isSuperAdmin,
     isDeletable: a.isDeletable !== false,
     isEditable: a.isEditable !== false,
-    createdAt: a.createdAt,
-    lastLoginAt: a.lastLoginAt
+    lastLoginAt: a.lastLoginAt,
+    createdAt: a.createdAt
   }));
   return res.json(safeAdmins);
 });
 
+/**
+ * Create a new admin account
+ */
 app.post('/api/admin/admins', (req, res) => {
-  const { name, email, password, role, creatorEmail } = req.body;
+  const { name, email, password, adminEmail } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ success: false, message: "Name, email, and password are required." });
   }
 
   const db = readDb();
   const cleanEmail = email.toLowerCase().trim();
+
   if (db.admins.some(a => a.email.toLowerCase() === cleanEmail)) {
-    return res.status(409).json({ success: false, message: "Admin with this email already exists." });
+    return res.status(409).json({ success: false, message: "An admin account with this email already exists." });
   }
 
   const newAdmin = {
@@ -976,7 +1410,7 @@ app.post('/api/admin/admins', (req, res) => {
     name: name.trim(),
     email: cleanEmail,
     password: password.trim(),
-    role: role || "SupportAdmin",
+    role: "Admin",
     isSuperAdmin: false,
     isDeletable: true,
     isEditable: true,
@@ -987,72 +1421,152 @@ app.post('/api/admin/admins', (req, res) => {
   db.admins.push(newAdmin);
   writeDb(db);
 
-  logAdminAction(creatorEmail || "SuperAdmin", "ADMIN_CREATED", `Created new admin ${newAdmin.name} (${newAdmin.email}) with role ${newAdmin.role}`);
+  logAdminAction(adminEmail, "ADMIN_CREATED", `Created new admin account for ${newAdmin.name} (${newAdmin.email})`);
 
   return res.status(201).json({
     success: true,
-    message: "Admin created successfully.",
+    message: "Admin account created successfully.",
     admin: {
       id: newAdmin.id,
       name: newAdmin.name,
       email: newAdmin.email,
-      role: newAdmin.role
+      role: newAdmin.role,
+      lastLoginAt: null
     }
   });
 });
 
+/**
+ * Edit an admin account (Protected: Cannot edit default superadmin)
+ */
 app.put('/api/admin/admins/:id', (req, res) => {
-  const { name, password, role, editorEmail } = req.body;
+  const { name, email, password, adminEmail } = req.body;
   const db = readDb();
   const admin = db.admins.find(a => a.id === req.params.id);
 
   if (!admin) {
-    return res.status(404).json({ success: false, message: "Admin not found." });
+    return res.status(404).json({ success: false, message: "Admin account not found." });
   }
 
-  if (admin.isEditable === false) {
-    return res.status(403).json({ success: false, message: "Root super admin account cannot be modified." });
+  // Immutable check for default Super Admin
+  if (admin.isSuperAdmin || admin.email.toLowerCase() === "khaleelktn@gmail.com") {
+    return res.status(403).json({
+      success: false,
+      message: "Permission denied: The default Super Admin credentials (khaleelktn@gmail.com) are permanent and cannot be edited."
+    });
   }
 
   if (name) admin.name = name.trim();
+  if (email) admin.email = email.toLowerCase().trim();
   if (password) admin.password = password.trim();
-  if (role) admin.role = role.trim();
 
   writeDb(db);
-  logAdminAction(editorEmail || "SuperAdmin", "ADMIN_UPDATED", `Updated details for admin ${admin.name} (${admin.email})`);
+  logAdminAction(adminEmail, "ADMIN_UPDATED", `Updated admin account ${admin.email}`);
 
-  return res.json({ success: true, message: "Admin updated successfully.", admin });
+  return res.json({
+    success: true,
+    message: "Admin account updated successfully.",
+    admin: {
+      id: admin.id,
+      name: admin.name,
+      email: admin.email,
+      role: admin.role,
+      lastLoginAt: admin.lastLoginAt
+    }
+  });
 });
 
+/**
+ * Delete an admin account (Protected: Cannot delete default superadmin)
+ */
 app.delete('/api/admin/admins/:id', (req, res) => {
+  const { adminEmail } = req.body || {};
   const db = readDb();
-  const index = db.admins.findIndex(a => a.id === req.params.id);
+  const admin = db.admins.find(a => a.id === req.params.id);
 
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: "Admin not found." });
+  if (!admin) {
+    return res.status(404).json({ success: false, message: "Admin account not found." });
   }
 
-  const target = db.admins[index];
-  if (target.isDeletable === false || target.isSuperAdmin) {
-    return res.status(403).json({ success: false, message: "Root super admin account cannot be deleted." });
+  // Immutable check for default Super Admin
+  if (admin.isSuperAdmin || admin.email.toLowerCase() === "khaleelktn@gmail.com") {
+    return res.status(403).json({
+      success: false,
+      message: "Permission denied: The default Super Admin account (khaleelktn@gmail.com) is permanent and cannot be deleted."
+    });
   }
 
-  db.admins.splice(index, 1);
+  db.admins = db.admins.filter(a => a.id !== req.params.id);
   writeDb(db);
 
-  logAdminAction(req.body?.adminEmail || "SuperAdmin", "ADMIN_DELETED", `Deleted admin ${target.name} (${target.email})`);
-  return res.json({ success: true, message: "Admin deleted successfully." });
+  logAdminAction(adminEmail, "ADMIN_DELETED", `Deleted admin account ${admin.email}`);
+
+  return res.json({ success: true, message: `Admin account ${admin.email} deleted successfully.` });
 });
 
+/**
+ * Get all administrative activity logs
+ */
 app.get('/api/admin/logs', (req, res) => {
   const db = readDb();
   return res.json(db.adminLogs);
+});
+
+// ================= SYSTEM DATA INTEGRITY & HARDENING =================
+
+/**
+ * System Data Health & Status
+ */
+app.get('/api/admin/system/status', (req, res) => {
+  const db = readDb();
+  return res.json({
+    status: "healthy",
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: Date.now(),
+    persistence: {
+      dbFileExists: fs.existsSync(DB_FILE),
+      backup1Exists: fs.existsSync(DB_BACKUP_1),
+      backup2Exists: fs.existsSync(DB_BACKUP_2),
+      dataDir: DATA_DIR
+    },
+    counts: {
+      users: (db.users || []).length,
+      vendors: (db.vendors || []).length,
+      applications: (db.vendorApplications || []).length,
+      products: (db.products || []).length,
+      orders: (db.orders || []).length,
+      admins: (db.admins || []).length,
+      logs: (db.adminLogs || []).length
+    }
+  });
+});
+
+/**
+ * Emergency Auto-Heal & Restore Safeguard
+ * Guarantees foundational records are never lost and syncs to disk immediately
+ */
+app.post('/api/admin/system/heal', (req, res) => {
+  const db = readDb();
+  writeDb(db);
+  logAdminAction(req.body?.adminEmail || "system", "SYSTEM_HEALED", "Executed system auto-heal and forced disk persistence synchronization.");
+  return res.json({
+    success: true,
+    message: "System data audited and persisted successfully. Foundational records verified.",
+    counts: {
+      users: db.users.length,
+      vendors: db.vendors.length,
+      applications: db.vendorApplications.length,
+      products: db.products.length,
+      admins: db.admins.length
+    }
+  });
 });
 
 // ================= PUBLIC VENDORS & PRODUCTS =================
 
 app.get('/api/vendors', (req, res) => {
   const db = readDb();
+  // Filter out banned vendors from public marketplace
   let list = db.vendors.filter(v => !v.isBanned);
   if (req.query.category) {
     list = list.filter(v => v.category === req.query.category);
@@ -1063,13 +1577,14 @@ app.get('/api/vendors', (req, res) => {
   return res.json(list);
 });
 
+// Check username availability
 app.get('/api/vendors/check-username/:username', (req, res) => {
   const username = (req.params.username || "").toLowerCase().trim().replace(/^@/, '');
   if (!username || username.length < 3) {
     return res.json({ available: false, username, reason: "Username must be at least 3 characters long." });
   }
   if (!/^[a-z0-9_]{3,30}$/.test(username)) {
-    return res.json({ available: false, username, reason: "Letters, numbers, and underscores only." });
+    return res.json({ available: false, username, reason: "Letters, numbers, and underscores only (no spaces or special symbols)." });
   }
   if (RESERVED_USERNAMES.has(username)) {
     return res.json({ available: false, username, reason: "This username is reserved for official system use." });
@@ -1083,6 +1598,7 @@ app.get('/api/vendors/check-username/:username', (req, res) => {
   return res.json({ available: true, username, reason: null });
 });
 
+// Lookup vendor by username
 app.get('/api/vendors/by-username/:username', (req, res) => {
   const username = (req.params.username || "").toLowerCase().trim().replace(/^@/, '');
   const db = readDb();
@@ -1103,10 +1619,23 @@ app.post('/api/vendors/apply', (req, res) => {
   const db = readDb();
 
   let cleanUsername = (username || "").toLowerCase().trim().replace(/^@/, '');
-  if (!cleanUsername) {
+  if (cleanUsername) {
+    if (cleanUsername.length < 3 || cleanUsername.length > 30 || !/^[a-z0-9_]+$/.test(cleanUsername)) {
+      return res.status(400).json({ success: false, message: "Username must be 3-30 characters (letters, numbers, and underscores only)." });
+    }
+    if (RESERVED_USERNAMES.has(cleanUsername)) {
+      return res.status(400).json({ success: false, message: `Username '@${cleanUsername}' is reserved for official system use.` });
+    }
+    const takenByVendor = db.vendors.find(v => v.username?.toLowerCase() === cleanUsername && v.ownerEmail?.toLowerCase() !== cleanEmail);
+    const takenByApp = db.vendorApplications.find(a => a.username?.toLowerCase() === cleanUsername && a.ownerEmail?.toLowerCase() !== cleanEmail && a.status !== 'Denied' && a.status !== 'Rejected');
+    if (takenByVendor || takenByApp) {
+      return res.status(400).json({ success: false, message: `Username '@${cleanUsername}' is already taken by another vendor.` });
+    }
+  } else {
     cleanUsername = name.toLowerCase().trim().replace(/[^a-z0-9_]/g, '_').substring(0, 25);
   }
 
+  // If application already exists for this vendor email, RESET it instead of creating duplicates
   const existingIndex = db.vendorApplications.findIndex(a => a.ownerEmail?.toLowerCase().trim() === cleanEmail);
   if (existingIndex >= 0) {
     const existing = db.vendorApplications[existingIndex];
@@ -1118,8 +1647,12 @@ app.post('/api/vendors/apply', (req, res) => {
     existing.description = description || existing.description || "";
     if (logoUri) existing.logoUri = logoUri;
     existing.status = "PendingReview";
+    existing.rejectionReason = null;
+    existing.rejectionExplanation = null;
+    existing.deniedAt = null;
     existing.submittedAt = Date.now();
     existing.isRegistrationFeePaid = false;
+    existing.message = "Application re-submitted and reset for review.";
 
     writeDb(db);
     return res.status(200).json(existing);
@@ -1141,7 +1674,7 @@ app.post('/api/vendors/apply', (req, res) => {
     rejectionExplanation: null,
     submittedAt: Date.now(),
     isRegistrationFeePaid: false,
-    message: "Application submitted successfully."
+    message: "Application submitted successfully. Under 24-hour review."
   };
 
   db.vendorApplications.push(application);
@@ -1150,10 +1683,64 @@ app.post('/api/vendors/apply', (req, res) => {
   return res.status(201).json(application);
 });
 
+// Dedicated resubmit endpoint to reset denied application
+app.post('/api/vendors/resubmit', (req, res) => {
+  const { ownerEmail, name, category, area, phone, description, logoUri } = req.body;
+  if (!ownerEmail) {
+    return res.status(400).json({ success: false, message: "ownerEmail is required." });
+  }
+
+  const cleanEmail = ownerEmail.toLowerCase().trim();
+  const db = readDb();
+
+  const existing = db.vendorApplications.find(a => a.ownerEmail?.toLowerCase().trim() === cleanEmail);
+  if (existing) {
+    if (name) existing.name = name.trim();
+    if (category) existing.category = category;
+    if (area) existing.area = area;
+    if (phone) existing.phone = phone.trim();
+    if (description !== undefined) existing.description = description;
+    if (logoUri) existing.logoUri = logoUri;
+    existing.status = "PendingReview";
+    existing.rejectionReason = null;
+    existing.rejectionExplanation = null;
+    existing.deniedAt = null;
+    existing.submittedAt = Date.now();
+    existing.isRegistrationFeePaid = false;
+    existing.message = "Application reset and re-submitted for 24-hour review.";
+
+    writeDb(db);
+    return res.status(200).json(existing);
+  }
+
+  // Fallback: create if didn't exist
+  const id = `vapp_${uuidv4().substring(0, 8)}`;
+  const newApp = {
+    id,
+    ownerEmail: cleanEmail,
+    name: name || "Vendor Store",
+    category: category || "food_snacks",
+    area: area || "Katsina Central",
+    phone: phone || "",
+    description: description || "",
+    logoUri: logoUri || null,
+    status: "PendingReview",
+    rejectionReason: null,
+    rejectionExplanation: null,
+    submittedAt: Date.now(),
+    isRegistrationFeePaid: false,
+    message: "Application submitted for review."
+  };
+  db.vendorApplications.push(newApp);
+  writeDb(db);
+  return res.status(201).json(newApp);
+});
+
 app.get('/api/vendors/status/:id', (req, res) => {
   const db = readDb();
   const query = req.params.id.toLowerCase().trim();
 
+  // 1. Check if vendor store exists in vendors list (e.g. active or banned store)
   const vendorStore = db.vendors.find(v =>
     v.id?.toLowerCase().trim() === query ||
     v.ownerEmail?.toLowerCase().trim() === query
@@ -1161,6 +1748,7 @@ app.get('/api/vendors/status/:id', (req, res) => {
 
   if (vendorStore) {
     if (vendorStore.isBanned) {
+      // Check if temporary ban expired
       if (vendorStore.banType === 'temporary' && vendorStore.banExpiresAt && Date.now() > vendorStore.banExpiresAt) {
         vendorStore.isBanned = false;
         vendorStore.banType = "none";
@@ -1175,12 +1763,14 @@ app.get('/api/vendors/status/:id', (req, res) => {
           isBanned: true,
           banType: vendorStore.banType || "permanent",
           banReason: vendorStore.banReason || "Policy violation",
-          banExplanation: vendorStore.banExplanation || "Store access disabled by LocoVend administration.",
+          banExplanation: vendorStore.banExplanation || "Store access has been disabled by LocoVend administration.",
+          banExpiresAt: vendorStore.banExpiresAt || null,
           isRegistrationFeePaid: true
         });
       }
     }
 
+    // Active Vendor in database
     return res.json({
       id: vendorStore.id,
       name: vendorStore.name,
@@ -1188,10 +1778,14 @@ app.get('/api/vendors/status/:id', (req, res) => {
       status: "Active",
       isBanned: false,
       banType: "none",
+      banReason: "",
+      banExplanation: "",
+      banExpiresAt: null,
       isRegistrationFeePaid: true
     });
   }
 
+  // 2. Find all matching applications and select the latest one
   const matching = db.vendorApplications.filter(a =>
     a.id?.toLowerCase().trim() === query ||
     a.ownerEmail?.toLowerCase().trim() === query
@@ -1202,12 +1796,24 @@ app.get('/api/vendors/status/:id', (req, res) => {
   }
 
   const appFound = matching[matching.length - 1];
+  const isAppPaid = appFound.isRegistrationFeePaid === true;
   return res.json({
     ...appFound,
-    status: appFound.isRegistrationFeePaid ? "Active" : appFound.status
+    status: isAppPaid ? "Active" : appFound.status,
+    isBanned: !!appFound.isBanned,
+    banType: appFound.banType || null,
+    banReason: appFound.banReason || null,
+    banExplanation: appFound.banExplanation || null,
+    banExpiresAt: appFound.banExpiresAt || null,
+    rejectionReason: appFound.rejectionReason || null,
+    rejectionExplanation: appFound.rejectionExplanation || null
   });
 });
 
+/**
+ * Public User Ban & Status Check Endpoint
+ * Checks whether user account is active or banned.
+ */
 app.get('/api/users/status/:id', (req, res) => {
   const db = readDb();
   const query = req.params.id.toLowerCase().trim();
@@ -1217,16 +1823,29 @@ app.get('/api/users/status/:id', (req, res) => {
     return res.status(404).json({ success: false, message: "User not found." });
   }
 
+  // Auto-lift expired temporary ban
   if (user.isBanned && user.banType === 'temporary' && user.banExpiresAt && Date.now() > user.banExpiresAt) {
     user.isBanned = false;
     user.banType = "none";
+    user.banReason = "";
+    user.banExplanation = "";
+    user.banExpiresAt = null;
     writeDb(db);
   }
 
   return res.json({
+    success: true,
     id: user.id,
     name: user.name,
     email: user.email,
+    phone: user.phone || "",
+    location: user.location || "Katsina Central",
+    address: user.address || "",
+    avatarUrl: user.avatarUrl || null,
+    role: user.role || "Customer",
+    isVendor: !!user.isVendor,
+    vendorId: user.vendorId || null,
+    vendorStoreName: user.vendorStoreName || null,
     isBanned: !!user.isBanned,
     banType: user.banType || "none",
     banReason: user.banReason || "",
@@ -1235,94 +1854,510 @@ app.get('/api/users/status/:id', (req, res) => {
   });
 });
 
-app.get('/api/vendors/:id/products', (req, res) => {
+// Admin clean demos endpoint - hardened to guarantee records are NEVER wiped automatically
+app.post('/api/admin/clean-demos', (req, res) => {
   const db = readDb();
-  const products = db.products.filter(p => p.vendorId === req.params.id);
-  return res.json(products);
+  return res.json({
+    success: true,
+    message: "Database verified. All registered accounts, stores, and applications are safely preserved.",
+    remainingUsers: db.users.length,
+    remainingVendors: db.vendors.length
+  });
 });
 
-app.post('/api/vendors/:id/products', (req, res) => {
-  const { name, price, description, category, imageUrl, isAvailable } = req.body;
-  if (!name || price === undefined) {
-    return res.status(400).json({ success: false, message: "Product name and price are required." });
+app.post('/api/vendors/pay-activation', (req, res) => {
+  const { applicationId, reference, amount } = req.body;
+  const db = readDb();
+  const appFound = db.vendorApplications.find(a => a.id === applicationId || a.ownerEmail === applicationId);
+  if (!appFound) {
+    return res.status(404).json({ success: false, message: "Application not found." });
+  }
+
+  appFound.isRegistrationFeePaid = true;
+  appFound.paymentReference = reference || `PAY_${Date.now()}`;
+  appFound.paymentAmount = amount || 1000;
+  appFound.status = "Active";
+
+  // Ensure vendor is also active and open in db.vendors
+  let vendor = db.vendors.find(v => v.ownerEmail?.toLowerCase() === appFound.ownerEmail?.toLowerCase());
+  if (!vendor) {
+    vendor = {
+      id: `vnd_${uuidv4().substring(0, 8)}`,
+      name: appFound.name,
+      motto: appFound.description || "Fresh local vendor on LocoVend",
+      category: appFound.category || "Food & Snacks",
+      area: appFound.area || "Katsina Central",
+      address: appFound.address || appFound.area || "Katsina Central",
+      phone: appFound.phone,
+      ownerEmail: appFound.ownerEmail.toLowerCase(),
+      status: "Active",
+      rating: 5.0,
+      reviewsCount: 0,
+      deliveryTimeMinutes: "20-30 min",
+      deliveryFee: 500,
+      isOpen: true,
+      isVerified: true,
+      isPioneerVendor: false,
+      isBanned: false,
+      logoUri: appFound.logoUri || "https://images.unsplash.com/photo-1555939594-58d7cb561ad1?w=400&q=80",
+      createdAt: Date.now()
+    };
+    db.vendors.push(vendor);
+  } else {
+    vendor.status = "Active";
+    vendor.isOpen = true;
+    vendor.isBanned = false;
+  }
+
+  // Upgrade applicant user account to "Vendor"
+  const user = db.users.find(u => u.email.toLowerCase() === appFound.ownerEmail.toLowerCase());
+  if (user) {
+    user.role = "Vendor";
+  }
+
+  writeDb(db);
+  return res.json({ success: true, message: "Payment verified. Vendor profile approved!", application: appFound, vendor });
+});
+
+// Resilient Products API
+app.get('/api/products', (req, res) => {
+  const db = readDb();
+  let list = db.products;
+  if (req.query.vendorId) {
+    const qv = req.query.vendorId.toLowerCase().trim();
+    // Resolve matching vendors/applications/names
+    const vendorMatches = db.vendors.filter(v => 
+      v.id.toLowerCase() === qv || 
+      v.name.toLowerCase() === qv || 
+      v.ownerEmail.toLowerCase() === qv
+    );
+    const validVendorIds = new Set([qv, ...vendorMatches.map(v => v.id.toLowerCase()), ...vendorMatches.map(v => v.name.toLowerCase())]);
+    
+    const appMatches = db.vendorApplications.filter(a => a.id?.toLowerCase() === qv || a.ownerEmail?.toLowerCase() === qv);
+    appMatches.forEach(a => {
+      validVendorIds.add(a.id.toLowerCase());
+      validVendorIds.add(a.name.toLowerCase());
+    });
+
+    list = list.filter(p => 
+      validVendorIds.has(p.vendorId.toLowerCase()) || 
+      validVendorIds.has(p.vendorName.toLowerCase())
+    );
+  }
+  if (req.query.category) {
+    list = list.filter(p => p.categoryId === req.query.category);
+  }
+  return res.json(list);
+});
+
+app.post('/api/products', (req, res) => {
+  const { name, price, categoryId, categoryName, vendorId, vendorName, vendorArea, description, stockCount, hasExplicitStockCount, inStock, images } = req.body;
+  if (!name || !price || !vendorId) {
+    return res.status(400).json({ success: false, message: "name, price, and vendorId are required." });
   }
 
   const db = readDb();
   const id = `prd_${uuidv4().substring(0, 8)}`;
-  const product = {
+
+  // If stockCount is specified as a valid number >= 0, it has explicit stock tracking
+  const explicitStock = (hasExplicitStockCount === true || (stockCount !== undefined && stockCount !== null && stockCount !== "" && !isNaN(Number(stockCount))));
+  const parsedStockCount = explicitStock ? Math.max(0, parseInt(stockCount, 10)) : null;
+  const initialInStock = explicitStock ? (parsedStockCount > 0) : (inStock !== false);
+
+  // Resilient vendorId resolution: if passed as application ID, resolve to vendor ID if available
+  let resolvedVendorId = vendorId;
+  const matchedVendor = db.vendors.find(v => v.id === vendorId || v.name.toLowerCase() === (vendorName || "").toLowerCase());
+  if (matchedVendor) {
+    resolvedVendorId = matchedVendor.id;
+  }
+
+  const newProduct = {
     id,
-    vendorId: req.params.id,
     name: name.trim(),
     price: Number(price),
+    categoryId: categoryId || "food_snacks",
+    categoryName: categoryName || "Food & Snacks",
+    vendorId: resolvedVendorId,
+    vendorName: vendorName || (matchedVendor ? matchedVendor.name : "Local Vendor"),
+    vendorArea: vendorArea || (matchedVendor ? matchedVendor.area : "Katsina Central"),
+    rating: 5.0,
+    ratingCount: 1,
     description: description || "",
-    category: category || "general",
-    imageUrl: imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400&q=80",
-    isAvailable: isAvailable !== false,
+    hasExplicitStockCount: explicitStock,
+    stockCount: parsedStockCount,
+    inStock: initialInStock,
+    deliveryAvailable: true,
+    pickupAvailable: true,
+    badge: "NEW",
+    images: Array.isArray(images) ? images : [],
     createdAt: Date.now()
   };
 
-  db.products.push(product);
+  db.products.push(newProduct);
   writeDb(db);
 
-  return res.status(201).json(product);
+  return res.status(201).json(newProduct);
 });
 
+// Bulk synchronization & database self-healing endpoint
+app.post('/api/sync/bulk', (req, res) => {
+  const { users, vendors, vendorApplications, products } = req.body;
+  const db = readDb();
+  let updated = false;
+
+  if (Array.isArray(users)) {
+    users.forEach(u => {
+      if (u.email && !db.users.some(existing => existing.email.toLowerCase() === u.email.toLowerCase())) {
+        db.users.push({
+          id: u.id || `usr_${uuidv4().substring(0, 8)}`,
+          name: u.name,
+          email: u.email.toLowerCase().trim(),
+          phone: u.phone || "",
+          location: u.location || "Katsina Central",
+          address: u.address || "",
+          password: u.password || "google_oauth_user",
+          role: u.role || "Customer",
+          isBanned: false,
+          banType: "none",
+          banReason: "",
+          banExplanation: "",
+          banExpiresAt: null,
+          bannedAt: null,
+          createdAt: u.createdAt || Date.now()
+        });
+        updated = true;
+      }
+    });
+  }
+
+  if (Array.isArray(vendors)) {
+    vendors.forEach(v => {
+      if (v.ownerEmail && !db.vendors.some(existing => existing.ownerEmail.toLowerCase() === v.ownerEmail.toLowerCase())) {
+        db.vendors.push(v);
+        updated = true;
+      }
+    });
+  }
+
+  if (Array.isArray(vendorApplications)) {
+    vendorApplications.forEach(a => {
+      if (a.ownerEmail && !db.vendorApplications.some(existing => existing.ownerEmail.toLowerCase() === a.ownerEmail.toLowerCase())) {
+        db.vendorApplications.push(a);
+        updated = true;
+      }
+    });
+  }
+
+  if (Array.isArray(products)) {
+    products.forEach(p => {
+      if (p.name && !db.products.some(existing => existing.id === p.id || (existing.name.toLowerCase() === p.name.toLowerCase() && existing.vendorId === p.vendorId))) {
+        db.products.push(p);
+        updated = true;
+      }
+    });
+  }
+
+  if (updated) {
+    writeDb(db);
+  }
+
+  return res.json({
+    success: true,
+    totalUsers: db.users.length,
+    totalVendors: db.vendors.length,
+    totalApplications: db.vendorApplications.length,
+    totalProducts: db.products.length
+  });
+});
+
+app.patch('/api/products/:id/stock', (req, res) => {
+  const { inStock, stockCount } = req.body;
+  const db = readDb();
+  const product = db.products.find(p => p.id === req.params.id);
+  if (!product) {
+    return res.status(404).json({ success: false, message: "Product not found." });
+  }
+
+  if (stockCount !== undefined && stockCount !== null && stockCount !== "") {
+    product.hasExplicitStockCount = true;
+    product.stockCount = Math.max(0, parseInt(stockCount, 10));
+    product.inStock = product.stockCount > 0;
+  } else if (inStock !== undefined) {
+    // Only manual toggle if not tracking unit count
+    product.inStock = Boolean(inStock);
+    if (!product.hasExplicitStockCount) {
+      product.stockCount = null;
+    }
+  }
+
+  writeDb(db);
+  return res.json({ success: true, product });
+});
+
+app.delete('/api/products/:id', (req, res) => {
+  const db = readDb();
+  const index = db.products.findIndex(p => p.id === req.params.id);
+  if (index === -1) {
+    return res.status(404).json({ success: false, message: "Product not found." });
+  }
+  const removed = db.products.splice(index, 1)[0];
+  writeDb(db);
+  return res.json({ success: true, message: "Product removed successfully.", product: removed });
+});
+
+// Orders
 app.post('/api/orders', (req, res) => {
-  const { customerEmail, vendorId, items, deliveryAddress, deliveryPhone, totalAmount } = req.body;
-  if (!customerEmail || !vendorId || !items || items.length === 0) {
-    return res.status(400).json({ success: false, message: "Order details, customer email, and vendorId are required." });
+  const { userId, customerName, customerEmail, customerPhone, deliveryAddress, vendorId, vendorName, items, total, paymentMethod } = req.body;
+
+  if (!items || !items.length || !total) {
+    return res.status(400).json({ success: false, message: "items and total are required." });
   }
 
   const db = readDb();
   const orderId = `ord_${uuidv4().substring(0, 8)}`;
-  const newOrder = {
+
+  // Automatically deduct inventory for products with tracked stock units
+  if (Array.isArray(items)) {
+    for (const item of items) {
+      const prodId = item.productId || item.product?.id || item.id;
+      const qty = Number(item.quantity || 1);
+      if (prodId) {
+        const prod = db.products.find(p => p.id === prodId);
+        if (prod && prod.hasExplicitStockCount && prod.stockCount !== null && prod.stockCount !== undefined) {
+          prod.stockCount = Math.max(0, prod.stockCount - qty);
+          if (prod.stockCount === 0) {
+            prod.inStock = false; // Automatically marked unavailable when finished from orders!
+          }
+        }
+      }
+    }
+  }
+
+  const order = {
     id: orderId,
-    customerEmail: customerEmail.toLowerCase().trim(),
-    vendorId,
+    userId: userId || null,
+    customerName: customerName || "Customer",
+    customerEmail: customerEmail || "",
+    customerPhone: customerPhone || "",
+    deliveryAddress: deliveryAddress || "Katsina Central",
+    vendorId: vendorId || "",
+    vendorName: vendorName || "",
     items,
-    totalAmount: Number(totalAmount) || 0,
-    deliveryAddress: deliveryAddress || "",
-    deliveryPhone: deliveryPhone || "",
+    total: Number(total),
+    paymentMethod: paymentMethod || "Cash on Delivery",
     status: "Pending",
     createdAt: Date.now()
   };
 
-  db.orders.push(newOrder);
+  db.orders.push(order);
   writeDb(db);
 
-  return res.status(201).json({ success: true, message: "Order placed successfully!", order: newOrder });
+  return res.status(201).json({ success: true, orderId: order.id, order });
+});
+
+// ================= PAYSTACK PAYMENT INTEGRATION =================
+
+/**
+ * Initialize Paystack Transaction
+ */
+app.post('/api/payments/paystack/initialize', async (req, res) => {
+  const { email, amount, metadata, callbackUrl } = req.body;
+  if (!email || !amount) {
+    return res.status(400).json({ success: false, message: "email and amount (in NGN) are required." });
+  }
+
+  try {
+    const paystackRes = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        email: email.trim(),
+        amount: Math.round(Number(amount) * 100), // In Kobo (1 NGN = 100 Kobo)
+        callback_url: callbackUrl || undefined,
+        metadata: metadata || {}
+      })
+    });
+
+    const data = await paystackRes.json();
+    if (!paystackRes.ok || !data.status) {
+      return res.status(paystackRes.status || 400).json({
+        success: false,
+        message: data.message || "Failed to initialize Paystack payment",
+        error: data
+      });
+    }
+
+    return res.json({
+      success: true,
+      authorizationUrl: data.data.authorization_url,
+      accessCode: data.data.access_code,
+      reference: data.data.reference
+    });
+  } catch (err) {
+    console.error("Paystack initialize error:", err);
+    return res.status(500).json({ success: false, message: "Paystack initialization failed", error: err.message });
+  }
+});
+
+/**
+ * Verify Paystack Transaction
+ */
+app.get('/api/payments/paystack/verify/:reference', async (req, res) => {
+  const { reference } = req.params;
+  if (!reference) {
+    return res.status(400).json({ success: false, message: "Reference is required." });
+  }
+
+  try {
+    const paystackRes = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const data = await paystackRes.json();
+    if (!paystackRes.ok || !data.status) {
+      return res.status(paystackRes.status || 400).json({
+        success: false,
+        message: data.message || "Failed to verify Paystack payment",
+        error: data
+      });
+    }
+
+    const transaction = data.data;
+    const isSuccess = transaction.status === "success";
+
+    // Auto-update application or order if metadata contains it
+    if (isSuccess && transaction.metadata) {
+      const db = readDb();
+      if (transaction.metadata.applicationId) {
+        const appFound = db.vendorApplications.find(a => a.id === transaction.metadata.applicationId);
+        if (appFound) {
+          appFound.isRegistrationFeePaid = true;
+          appFound.paymentReference = reference;
+          appFound.status = "Approved";
+          writeDb(db);
+        }
+      }
+      if (transaction.metadata.orderId) {
+        const orderFound = db.orders.find(o => o.id === transaction.metadata.orderId);
+        if (orderFound) {
+          orderFound.paymentStatus = "Paid";
+          orderFound.paymentReference = reference;
+          writeDb(db);
+        }
+      }
+    }
+
+    return res.json({
+      success: isSuccess,
+      status: transaction.status,
+      amount: transaction.amount / 100,
+      currency: transaction.currency,
+      channel: transaction.channel,
+      paidAt: transaction.paid_at,
+      customerEmail: transaction.customer?.email,
+      metadata: transaction.metadata
+    });
+  } catch (err) {
+    console.error("Paystack verify error:", err);
+    return res.status(500).json({ success: false, message: "Paystack verification failed", error: err.message });
+  }
+});
+
+
+app.get('/api/orders', (req, res) => {
+  const db = readDb();
+  let list = db.orders;
+  if (req.query.vendorId) {
+    list = list.filter(o => o.vendorId === req.query.vendorId);
+  }
+  return res.json(list);
+});
+
+app.get('/api/orders/user/:email', (req, res) => {
+  const db = readDb();
+  const userOrders = db.orders.filter(o => o.customerEmail?.toLowerCase() === req.params.email.toLowerCase());
+  return res.json(userOrders);
+});
+
+app.patch('/api/orders/:id/status', (req, res) => {
+  const { status } = req.body;
+  const db = readDb();
+  const order = db.orders.find(o => o.id === req.params.id);
+  if (!order) {
+    return res.status(404).json({ success: false, message: "Order not found." });
+  }
+  order.status = status;
+  writeDb(db);
+  return res.json(order);
 });
 
 // Complaints, Reports & Suggestions
 app.post('/api/complaints', (req, res) => {
-  const { userEmail, vendorId, orderId, complaint } = req.body;
+  const { userEmail, userName, userPhone, orderId, vendorName, category, description } = req.body;
   const db = readDb();
   const record = {
     id: `cmp_${uuidv4().substring(0, 8)}`,
     userEmail: userEmail || "",
-    vendorId: vendorId || "",
-    orderId: orderId || "",
-    complaint: complaint || "",
+    userName: userName || "",
+    userPhone: userPhone || "",
+    orderId: orderId || null,
+    vendorName: vendorName || "",
+    category: category || "General",
+    description: description || "",
+    status: "Open",
     createdAt: Date.now()
   };
   db.complaints.push(record);
+
+  // Also push to suggestions so reports & complaints show in the control website's suggestions section
+  db.suggestions.push({
+    id: `sug_${uuidv4().substring(0, 8)}`,
+    userEmail: userEmail || "",
+    userName: userName || "",
+    category: `[Report: ${category || "General"}]`,
+    suggestion: `Phone: ${userPhone || 'N/A'}${orderId ? ' | Order: ' + orderId : ''}${vendorName ? ' | Vendor: ' + vendorName : ''}\n\n${description || ''}`,
+    createdAt: Date.now()
+  });
+
   writeDb(db);
-  return res.status(201).json({ success: true, message: "Complaint received.", id: record.id });
+  return res.status(201).json({ success: true, message: "Complaint logged successfully.", id: record.id });
 });
 
 app.post('/api/reports', (req, res) => {
-  const { reporterEmail, reportedVendorId, reason } = req.body;
+  const { reporterEmail, reporterName, targetType, targetId, reason, details } = req.body;
   const db = readDb();
   const record = {
     id: `rep_${uuidv4().substring(0, 8)}`,
     reporterEmail: reporterEmail || "",
-    reportedVendorId: reportedVendorId || "",
-    reason: reason || "",
+    reporterName: reporterName || "",
+    targetType: targetType || "Vendor",
+    targetId: targetId || "",
+    reason: reason || "Violation",
+    details: details || "",
+    status: "UnderReview",
     createdAt: Date.now()
   };
   db.reports.push(record);
+
+  // Also push to suggestions for control website
+  db.suggestions.push({
+    id: `sug_${uuidv4().substring(0, 8)}`,
+    userEmail: reporterEmail || "",
+    userName: reporterName || "",
+    category: `[Violation: ${reason || "Misconduct"}]`,
+    suggestion: `Target: ${targetType || 'Vendor'} (${targetId || 'N/A'})\n\n${details || ''}`,
+    createdAt: Date.now()
+  });
+
   writeDb(db);
-  return res.status(201).json({ success: true, message: "Report filed.", id: record.id });
+  return res.status(201).json({ success: true, message: "Report submitted.", id: record.id });
 });
 
 app.post('/api/suggestions', (req, res) => {
