@@ -181,13 +181,17 @@ function readDb() {
   if (!data.reports || !Array.isArray(data.reports)) data.reports = [];
   if (!data.suggestions || !Array.isArray(data.suggestions)) data.suggestions = [];
 
-  // Guarantee permanent existence of essential foundation accounts (WITHOUT resurrecting deleted vendors/apps)
+  if (!data.deletedUserEmails || !Array.isArray(data.deletedUserEmails)) {
+    data.deletedUserEmails = [];
+  }
+
+  // Only seed initial default users if they have NEVER been explicitly deleted!
   let didHeal = false;
-  if (!data.users.some(u => u.email?.toLowerCase() === "kcoding14@gmail.com")) {
+  if (!data.deletedUserEmails.includes("kcoding14@gmail.com") && !data.users.some(u => u.email?.toLowerCase() === "kcoding14@gmail.com")) {
     data.users.push(INITIAL_DATABASE.users[0]);
     didHeal = true;
   }
-  if (!data.users.some(u => u.email?.toLowerCase() === "phadeekt@gmail.com")) {
+  if (!data.deletedUserEmails.includes("phadeekt@gmail.com") && !data.users.some(u => u.email?.toLowerCase() === "phadeekt@gmail.com")) {
     data.users.push(INITIAL_DATABASE.users[1]);
     didHeal = true;
   }
@@ -743,21 +747,59 @@ app.all(['/api/admin/users/:id', '/api/users/:id', '/api/users/profile', '/api/u
 });
 
 /**
- * Delete a user account permanently
+ * Delete a user account permanently (protects SuperAdmin, cleans associated stores/apps)
  */
 app.delete(['/api/admin/users/:id', '/api/users/:id'], (req, res) => {
   const { adminEmail } = req.body || {};
   const db = readDb();
+  if (!db.deletedUserEmails || !Array.isArray(db.deletedUserEmails)) {
+    db.deletedUserEmails = [];
+  }
   const query = req.params.id.toLowerCase().trim();
-  const index = db.users.findIndex(u => u.id.toLowerCase() === query || u.email?.toLowerCase() === query);
+  const index = db.users.findIndex(u => u.id?.toLowerCase() === query || u.email?.toLowerCase() === query);
 
   if (index === -1) {
     return res.status(404).json({ success: false, message: "User not found." });
   }
 
+  const target = db.users[index];
+
+  // Protect SuperAdmin account
+  const isSuperAdminEmail = (target.email || "").toLowerCase() === "khaleelktn@gmail.com";
+  const isSuperAdminInAdmins = (db.admins || []).some(a =>
+    a.email?.toLowerCase() === target.email?.toLowerCase() && (a.isSuperAdmin || a.isDeletable === false)
+  );
+  if (isSuperAdminEmail || isSuperAdminInAdmins || target.role === "SuperAdmin") {
+    return res.status(403).json({ success: false, message: "Super Admin account is protected and cannot be deleted." });
+  }
+
   const removed = db.users.splice(index, 1)[0];
+  const targetEmail = (removed.email || "").toLowerCase().trim();
+
+  if (targetEmail && !db.deletedUserEmails.includes(targetEmail)) {
+    db.deletedUserEmails.push(targetEmail);
+  }
+
+  // Also remove associated vendor store if present
+  if (db.vendors && Array.isArray(db.vendors)) {
+    const vIdx = db.vendors.findIndex(v => v.ownerEmail?.toLowerCase() === targetEmail || v.id === query);
+    if (vIdx !== -1) {
+      db.vendors.splice(vIdx, 1);
+    }
+  }
+
+  // Also remove associated vendor applications
+  if (db.vendorApplications && Array.isArray(db.vendorApplications)) {
+    db.vendorApplications = db.vendorApplications.filter(a => a.ownerEmail?.toLowerCase() !== targetEmail);
+  }
+
+  // Also remove associated store IDs
+  if (db.storeIds && Array.isArray(db.storeIds)) {
+    db.storeIds = db.storeIds.filter(s => s.accountEmail?.toLowerCase() !== targetEmail && s.email?.toLowerCase() !== targetEmail);
+  }
+
   writeDb(db);
-  logAdminAction(adminEmail || "SuperAdmin", "USER_DELETED", `Deleted user account ${removed.email} (${removed.name})`);
+  logAdminAction(adminEmail || "SuperAdmin", "USER_DELETED", `Permanently deleted user account ${removed.email} (${removed.name})`);
   return res.json({ success: true, message: `User ${removed.email} deleted successfully.`, user: removed });
 });
 
